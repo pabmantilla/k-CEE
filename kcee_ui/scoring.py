@@ -1,35 +1,73 @@
 """Per-sequence scalar scores: cossim, eigenMaps, deviation-from-shared."""
-import pickle
-from pathlib import Path
 import numpy as np
 
 
-def cossim_score(attr_a: np.ndarray, attr_b: np.ndarray) -> np.ndarray:
-    """Per-sequence cosine similarity between two attribution stacks of shape (N, 4, L)."""
-    a = attr_a.reshape(attr_a.shape[0], -1)
-    b = attr_b.reshape(attr_b.shape[0], -1)
+ENHANCER_LEN = 230
+ADAPTER_LEN = 15  # constant cloning adapter at each end of the 230-bp insert
+INSERT_START = ADAPTER_LEN
+INSERT_STOP = ENHANCER_LEN - ADAPTER_LEN  # exclusive; variable region = 200 bp
+
+
+def attr_to_importance(attr: np.ndarray, onehot: np.ndarray) -> np.ndarray:
+    """(N, 4, L) attribution * (N, 4, L) onehot -> (N, L) importance.
+
+    Matches eigen_steering.EigenMap.importance: for the WT base at each
+    position, picks the attribution channel and sums (other channels are
+    zeroed by the one-hot).
+    """
+    return (attr * onehot).sum(axis=1)
+
+
+def _z_normalize_per_row(x: np.ndarray) -> np.ndarray:
+    """Per-row z-norm: subtract mean, divide by std (replace zero-std with 1)."""
+    mu = x.mean(axis=1, keepdims=True)
+    sd = x.std(axis=1, keepdims=True)
+    sd = np.where(sd == 0, 1.0, sd)
+    return (x - mu) / sd
+
+
+def cossim_score(imp_a: np.ndarray, imp_b: np.ndarray,
+                 start: int = INSERT_START, stop: int = INSERT_STOP) -> np.ndarray:
+    """Per-sequence cosine similarity on z-normalized importance over the
+    variable insert region (skips the constant cloning adapters at each end)."""
+    a = _z_normalize_per_row(imp_a[:, start:stop])
+    b = _z_normalize_per_row(imp_b[:, start:stop])
     num = (a * b).sum(axis=1)
     den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
-    out = np.zeros_like(num)
+    out = np.zeros_like(num, dtype=np.float32)
     nz = den > 0
-    out[nz] = num[nz] / den[nz]
+    out[nz] = (num[nz] / den[nz]).astype(np.float32)
     return out
 
 
-def eigenmaps_score(pkl_path: str | Path, key: str = "EI_1 var x r") -> np.ndarray:
-    """Load a per-sequence eigenMaps scalar from an eigen_analysis.pkl.
+def eigenmaps_score(imp_a: np.ndarray, imp_b: np.ndarray,
+                    start: int = INSERT_START, stop: int = INSERT_STOP) -> np.ndarray:
+    """Per-sequence EigenMaps "EI_1 var x r" on z-normalized importance over
+    the first `enhancer_len` positions. Closed-form 2x2 eigendecomposition.
 
-    Canonical formula (per genomic_targets/scripts/2d_targeting/hippo_target_selection.ipynb
-    and 2d_diff_call/scripts/notebooks/eixr_distribution.ipynb):
-        EI_1 var x r = ei1_var * corrs
+    For each sequence i:
+        E = z-normalized (L, 2) matrix [imp_a_i, imp_b_i]
+        cov = E.T @ E / L                  # 2x2; on-diag ~1, off-diag = r
+        eigenvalues of cov (closed form)
+        var_ratio = lam0 / (lam0 + lam1)
+        score = var_ratio * r              # r is cov[0,1] which equals
+                                            # corrcoef(E[:,0], E[:,1])[0,1]
+                                            # because columns are unit-var.
     """
-    with open(pkl_path, "rb") as f:
-        cached = pickle.load(f)
-    if isinstance(cached, dict) and key in cached:
-        return np.asarray(cached[key], dtype=np.float32)
-    if "ei1_var" in cached and "corrs" in cached:
-        return np.asarray(cached["ei1_var"], dtype=np.float32) * np.asarray(cached["corrs"], dtype=np.float32)
-    raise KeyError(f"Could not find '{key}' or (ei1_var, corrs) in {pkl_path}")
+    L = stop - start
+    a = _z_normalize_per_row(imp_a[:, start:stop]).astype(np.float64)
+    b = _z_normalize_per_row(imp_b[:, start:stop]).astype(np.float64)
+    c00 = (a * a).sum(axis=1) / L
+    c11 = (b * b).sum(axis=1) / L
+    c01 = (a * b).sum(axis=1) / L
+    tr = c00 + c11
+    det = c00 * c11 - c01 * c01
+    disc = np.sqrt(np.maximum(tr * tr - 4 * det, 0.0))
+    lam0 = 0.5 * (tr + disc)
+    lam1 = 0.5 * (tr - disc)
+    total = lam0 + lam1
+    var_ratio = np.where(total > 0, lam0 / total, 0.0)
+    return (var_ratio * c01).astype(np.float32)
 
 
 def deviation_from_shared(attr_list: list[np.ndarray]) -> np.ndarray:
@@ -48,7 +86,7 @@ def deviation_from_shared(attr_list: list[np.ndarray]) -> np.ndarray:
     n = min(a.shape[0] for a in attr_list)
     stacks = np.stack([a[:n].reshape(n, -1) for a in attr_list], axis=1)  # (n, n_ct, F)
     n_ct = stacks.shape[1]
-    parallel_sq = (stacks.sum(axis=1) ** 2) / n_ct  # ((sum v_i)^2)/n_ct == |proj|^2 per element
+    parallel_sq = (stacks.sum(axis=1) ** 2) / n_ct
     total_sq = (stacks ** 2).sum(axis=1)
     perp_sq = total_sq - parallel_sq
     num = perp_sq.sum(axis=1)

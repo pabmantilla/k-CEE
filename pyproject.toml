@@ -9,7 +9,6 @@ dependencies = [
     "pandas>=2.0",
     "h5py>=3.9",
     "matplotlib>=3.7",
-    "logomaker>=0.8",
     "plotly>=5.18",
 ]
 

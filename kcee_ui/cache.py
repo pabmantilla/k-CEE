@@ -67,6 +67,22 @@ def mmap_array(npz_path: str | Path, key: str) -> np.ndarray:
     return np.load(npy_path, mmap_mode="r")
 
 
+def load_attr_row(path: str | Path, key: str, idx: int) -> np.ndarray:
+    """Read a single (4, L) row from an attribution file.
+
+    For .h5/.hdf5: open per call and slice — h5py reads only the requested row,
+    avoiding the full-array materialization that mmap_array does. For .npz, fall
+    back to mmap_array(...)[idx] (npz cannot do true lazy row access; the
+    one-time .npy extraction is already cached on disk).
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in (".h5", ".hdf5"):
+        import h5py
+        with h5py.File(str(path), "r") as f:
+            return np.asarray(f[key][int(idx), :, :])
+    return np.asarray(mmap_array(path, key)[int(idx)])
+
+
 def cached_npy(name: str, deps: tuple, compute_fn) -> np.ndarray:
     """Disk-cached compute. `deps` are stringified into the cache key."""
     h = _hash(name, *(str(d) for d in deps))

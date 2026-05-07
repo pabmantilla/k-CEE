@@ -20,6 +20,7 @@ from kcee_ui.plotting import plot_attribution
 from kcee_ui.data import load_library, seq_to_onehot
 from kcee_ui.finemo import load_finemo_hits
 from kcee_ui.defaults import DEFAULT_SLOTS, DEFAULT_EIGEN_PKL, DEFAULT_LIBRARY_CSV
+from kcee_ui.cache import mmap_array, cached_npy, cache_dir, cache_size_mb, clear_cache, _mtime
 
 
 st.set_page_config(page_title="k-CEE attribution browser", layout="wide")
@@ -37,9 +38,10 @@ def short_name(name: str) -> str:
 
 
 # --- caches ---
-@st.cache_data(show_spinner="loading attributions…")
+@st.cache_data(show_spinner="extracting attributions to local cache (one-time)…")
 def _cached_load(path: str, key: str) -> np.ndarray:
-    return load_attr_file(path, key)
+    """Returns a mmap'd .npy view. First call extracts; subsequent are instant."""
+    return mmap_array(path, key)
 
 
 @st.cache_data(show_spinner=False)
@@ -225,19 +227,35 @@ def _common_csv(slots_subset: list[dict]) -> np.ndarray:
 @st.cache_data(show_spinner="computing cossim…")
 def _cossim_aligned(path_a: str, key_a: str, path_b: str, key_b: str,
                     npz_a: tuple, npz_b: tuple) -> np.ndarray:
-    a = _cached_load(path_a, key_a)[list(npz_a)]
-    b = _cached_load(path_b, key_b)[list(npz_b)]
-    return cossim_score(a, b)
+    deps = (path_a, key_a, _mtime(path_a), path_b, key_b, _mtime(path_b),
+            len(npz_a), int(np.sum(npz_a)), int(np.sum(npz_b)))
+
+    def _go():
+        a = _cached_load(path_a, key_a)[list(npz_a)]
+        b = _cached_load(path_b, key_b)[list(npz_b)]
+        return cossim_score(np.asarray(a), np.asarray(b))
+
+    return cached_npy("cossim", deps, _go)
 
 
 @st.cache_data(show_spinner="computing dev_from_shared…")
 def _dev_aligned(paths: tuple[tuple[str, str], ...], idxs: tuple[tuple, ...]) -> np.ndarray:
-    arrs = [_cached_load(p, k)[list(ix)] for (p, k), ix in zip(paths, idxs)]
-    return deviation_from_shared(arrs)
+    deps = tuple(
+        (p, k, _mtime(p), len(ix), int(np.sum(ix)))
+        for (p, k), ix in zip(paths, idxs)
+    )
+
+    def _go():
+        arrs = [np.asarray(_cached_load(p, k)[list(ix)]) for (p, k), ix in zip(paths, idxs)]
+        return deviation_from_shared(arrs)
+
+    return cached_npy("dev_from_shared", deps, _go)
 
 
 scores: np.ndarray | None = None  # aligned to `common_csv` (below)
 score_label = "—"
+score_cmap = "Viridis"
+score_zmid: float | None = None
 common_csv: np.ndarray = np.array([], dtype=np.int64)
 
 if loaded and ABC and library is not None:
@@ -256,6 +274,8 @@ if loaded and ABC and library is not None:
                     tuple(b["attr_csv_to_npz"][common_csv].tolist()),
                 )
                 score_label = f"cossim({short_name(a['name'])}, {short_name(b['name'])})"
+                score_cmap = "RdBu_r"
+                score_zmid = 0.0
             except Exception as e:
                 st.sidebar.error(str(e))
         else:  # eigenMaps
@@ -270,6 +290,7 @@ if loaded and ABC and library is not None:
                     common_csv = common_csv[valid]
                     scores = eig_full[a_npz[valid]]
                     score_label = f"eigenMaps[{eig_key}]"
+                    score_cmap = "Inferno"
                 except Exception as e:
                     st.sidebar.error(str(e))
             elif pkl:
@@ -281,6 +302,7 @@ if loaded and ABC and library is not None:
                 idxs = tuple(tuple(s["attr_csv_to_npz"][common_csv].tolist()) for s in sl_subset)
                 scores = _dev_aligned(paths, idxs)
                 score_label = f"dev_from_shared({', '.join(short_name(s['name']) for s in sl_subset)})"
+                score_cmap = "Turbo"
             except Exception as e:
                 st.sidebar.error(str(e))
         else:
@@ -290,6 +312,14 @@ if loaded and ABC and library is not None:
 # --- sidebar: display options ---
 st.sidebar.header("Display")
 show_wt_logo = st.sidebar.checkbox("WT-projected logo (attr × onehot)", value=False)
+
+# --- sidebar: cache ---
+with st.sidebar.expander("Cache", expanded=False):
+    st.caption(str(cache_dir()))
+    st.caption(f"size: {cache_size_mb():.1f} MB")
+    if st.button("Clear cache"):
+        n = clear_cache()
+        st.success(f"Cleared {n} files. Restart to rebuild.")
 
 
 def _hits_to_local(hits, start_hg38, stop_hg38, strand, attr_L):
@@ -351,8 +381,9 @@ fig.add_trace(
         marker=dict(
             size=4,
             color=y[valid],
-            colorscale="Inferno",
-            opacity=0.6,
+            colorscale=score_cmap,
+            cmid=score_zmid,
+            opacity=0.7,
             colorbar=dict(title=score_label),
         ),
         customdata=common_csv[valid],
@@ -363,19 +394,21 @@ fig.add_trace(
 fig.update_layout(
     xaxis_title="log2FC (HepG2 / K562)   [func]",
     yaxis_title=f"{score_label}   [mech]",
-    height=520,
+    height=720,
     margin=dict(l=40, r=20, t=30, b=40),
     template="plotly_white",
     dragmode="zoom",
 )
 
-event = st.plotly_chart(
-    fig,
-    use_container_width=True,
-    on_select="rerun",
-    selection_mode=("points",),
-    key="scatter",
-)
+_lpad, _center, _rpad = st.columns([1, 2.5, 1])
+with _center:
+    event = st.plotly_chart(
+        fig,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode=("points",),
+        key="scatter",
+    )
 
 
 # --- selected point: csv row ---

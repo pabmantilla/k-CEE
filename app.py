@@ -28,7 +28,6 @@ st.title("k-CEE attribution browser")
 
 N_SLOTS = 3
 ENHANCER_LEN = 230
-SEQ_FLANK_PAD = 15  # library seqs span start_hg38..stop_hg38 plus 15bp each side.
 NAME_MAX = 24
 
 
@@ -322,22 +321,15 @@ with st.sidebar.expander("Cache", expanded=False):
         st.success(f"Cleared {n} files. Restart to rebuild.")
 
 
-def _hits_to_local(hits, start_hg38, stop_hg38, strand, attr_L):
+def _hits_to_local(hits, start_hg38, attr_L):
+    """Per ctcf_focus.ipynb: x = hit.start - start_hg38. No pad, no strand mirror."""
     out = []
-    if hits is None or not np.isfinite(start_hg38) or not np.isfinite(stop_hg38):
+    if hits is None or not np.isfinite(start_hg38):
         return out
-    seq_g_start = start_hg38 - SEQ_FLANK_PAD
-    seq_g_end = stop_hg38 + SEQ_FLANK_PAD
+    peak_start = int(start_hg38)
     for h in hits:
-        hs, he = int(h["start"]), int(h["end"])
-        if max(hs, he) < attr_L:
-            s, e = hs, he
-        elif strand == "-":
-            s = int(seq_g_end - he)
-            e = int(seq_g_end - hs)
-        else:
-            s = int(hs - seq_g_start)
-            e = int(he - seq_g_start)
+        s = int(h["start"]) - peak_start
+        e = int(h["end"]) - peak_start
         if 0 <= s < attr_L and e > s:
             out.append({**h, "start": s, "end": min(e, attr_L)})
     return out
@@ -474,8 +466,6 @@ for s in display_slots:
     hits = _hits_to_local(
         raw_hits,
         float(row.get("start_hg38", float("nan"))),
-        float(row.get("stop_hg38", float("nan"))),
-        str(row.get("str_hg38", "+") or "+"),
         attr_L,
     )
     title = f"{s['cell_type']} · {short_name(s['name'])}"

@@ -19,15 +19,17 @@ def cossim_score(attr_a: np.ndarray, attr_b: np.ndarray) -> np.ndarray:
 def eigenmaps_score(pkl_path: str | Path, key: str = "EI_1 var x r") -> np.ndarray:
     """Load a per-sequence eigenMaps scalar from an eigen_analysis.pkl.
 
-    Falls back to ei1_var * ratio if `key` not present.
+    Canonical formula (per genomic_targets/scripts/2d_targeting/hippo_target_selection.ipynb
+    and 2d_diff_call/scripts/notebooks/eixr_distribution.ipynb):
+        EI_1 var x r = ei1_var * corrs
     """
     with open(pkl_path, "rb") as f:
         cached = pickle.load(f)
     if isinstance(cached, dict) and key in cached:
         return np.asarray(cached[key], dtype=np.float32)
-    if "ei1_var" in cached and "ratio" in cached:
-        return np.asarray(cached["ei1_var"], dtype=np.float32) * np.asarray(cached["ratio"], dtype=np.float32)
-    raise KeyError(f"Could not find '{key}' or (ei1_var, ratio) in {pkl_path}")
+    if "ei1_var" in cached and "corrs" in cached:
+        return np.asarray(cached["ei1_var"], dtype=np.float32) * np.asarray(cached["corrs"], dtype=np.float32)
+    raise KeyError(f"Could not find '{key}' or (ei1_var, corrs) in {pkl_path}")
 
 
 def deviation_from_shared(attr_list: list[np.ndarray]) -> np.ndarray:

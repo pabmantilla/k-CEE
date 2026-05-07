@@ -14,15 +14,6 @@ DEFAULT_LIBRARY_CSV = os.environ.get("KCEE_LIBRARY_CSV", f"{_REPO}/data/joint_li
 
 DEFAULT_SLOTS: list[dict] = [
     {
-        "cell_type": "K562",
-        "model": "K562_v6_do075",
-        "key": "attr_K562",
-        "pred_key": "predictions_K562",
-        "log2fc_col": "K562_log2FC",
-        "path": DEFAULT_ATTR_FILE,
-        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/K562/hits.tsv",
-    },
-    {
         "cell_type": "HepG2",
         "model": "HepG2_v6_do03",
         "key": "attr_HepG2",
@@ -30,6 +21,15 @@ DEFAULT_SLOTS: list[dict] = [
         "log2fc_col": "HepG2_log2FC",
         "path": DEFAULT_ATTR_FILE,
         "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/HepG2/hits.tsv",
+    },
+    {
+        "cell_type": "K562",
+        "model": "K562_v6_do075",
+        "key": "attr_K562",
+        "pred_key": "predictions_K562",
+        "log2fc_col": "K562_log2FC",
+        "path": DEFAULT_ATTR_FILE,
+        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/K562/hits.tsv",
     },
     {
         "cell_type": "WTC11",

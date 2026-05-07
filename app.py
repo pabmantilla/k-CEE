@@ -130,10 +130,15 @@ for i in range(N_SLOTS):
 loaded = [s for s in slots if s.get("path")]
 
 
-# --- npz <-> csv mapping per slot (canonical: rows where library['sequence'] is non-null
-# match K562/HepG2 attributions; WTC11 is identity) ---
-def _build_csv_to_npz(slot, library_df: pd.DataFrame) -> np.ndarray:
-    """Return an int array of length len(library) mapping csv_row -> npz_row, -1 if missing."""
+# --- per-slot mappings ---
+# attr_csv_to_npz: csv_row -> row in deeplift_attributions.npz (seq_valid filter for
+#   K562/HepG2 (56978), identity for WTC11 (56980)).
+# finemo_csv_to_pid: csv_row -> peak_id in finemo hits.tsv. Built from the canonical
+#   regions.npz (sibling of hits.tsv) which holds peak_name in finemo order; this
+#   ordering differs from the deeplift order because regions.npz has additional
+#   per-CT filtering (e.g. K562_log2FC.notna()).
+
+def _build_attr_csv_to_npz(slot, library_df: pd.DataFrame) -> np.ndarray:
     n_attr = slot["n_attr"]
     n_csv = len(library_df)
     out = np.full(n_csv, -1, dtype=np.int64)
@@ -144,19 +149,45 @@ def _build_csv_to_npz(slot, library_df: pd.DataFrame) -> np.ndarray:
         return out
     seq_valid = library_df["sequence"].notna().values
     if int(seq_valid.sum()) == n_attr:
-        valid_csv_idx = np.nonzero(seq_valid)[0]
-        out[valid_csv_idx] = np.arange(n_attr)
+        out[np.nonzero(seq_valid)[0]] = np.arange(n_attr)
         return out
-    # fallback: identity over min(n_attr, n_csv)
     m = min(n_attr, n_csv)
     out[:m] = np.arange(m)
     return out
 
 
+@st.cache_data(show_spinner=False)
+def _cached_finemo_csv_to_pid(finemo_tsv_path: str, name_to_csv_keys: tuple[str, ...],
+                               name_to_csv_vals: tuple[int, ...]) -> np.ndarray | None:
+    """Build csv_row -> finemo peak_id using the regions.npz sibling of hits.tsv."""
+    if not finemo_tsv_path:
+        return None
+    regions_path = Path(finemo_tsv_path).parent / "regions.npz"
+    if not regions_path.exists():
+        return None
+    r = np.load(regions_path, allow_pickle=True)
+    if "peak_name" not in r.files:
+        return None
+    peak_names = r["peak_name"]
+    n_csv = len(name_to_csv_keys)
+    n2c = dict(zip(name_to_csv_keys, name_to_csv_vals))
+    pid_for_csv = np.full(n_csv, -1, dtype=np.int64)
+    for pid, pn in enumerate(peak_names):
+        c = n2c.get(str(pn))
+        if c is not None:
+            pid_for_csv[c] = pid
+    return pid_for_csv
+
+
 if loaded and library is not None:
+    name_keys = tuple(library["name"].astype(str).tolist())
+    name_vals = tuple(range(len(library)))
     for s in loaded:
-        s["csv_to_npz"] = _build_csv_to_npz(s, library)
-        s["covered_csv"] = np.nonzero(s["csv_to_npz"] >= 0)[0]
+        s["attr_csv_to_npz"] = _build_attr_csv_to_npz(s, library)
+        s["covered_csv"] = np.nonzero(s["attr_csv_to_npz"] >= 0)[0]
+        s["finemo_csv_to_pid"] = _cached_finemo_csv_to_pid(
+            s.get("finemo_tsv", ""), name_keys, name_vals
+        )
 
 
 # --- sidebar: comparison mode ---
@@ -221,8 +252,8 @@ if loaded and ABC and library is not None:
             try:
                 scores = _cossim_aligned(
                     a["path"], a["key"], b["path"], b["key"],
-                    tuple(a["csv_to_npz"][common_csv].tolist()),
-                    tuple(b["csv_to_npz"][common_csv].tolist()),
+                    tuple(a["attr_csv_to_npz"][common_csv].tolist()),
+                    tuple(b["attr_csv_to_npz"][common_csv].tolist()),
                 )
                 score_label = f"cossim({short_name(a['name'])}, {short_name(b['name'])})"
             except Exception as e:
@@ -234,7 +265,7 @@ if loaded and ABC and library is not None:
                 try:
                     eig_full = _cached_eigenmaps(pkl, eig_key)
                     # eigen pkl has its own length; align by truncating to min over common_csv positions in a's npz space
-                    a_npz = a["csv_to_npz"][common_csv]
+                    a_npz = a["attr_csv_to_npz"][common_csv]
                     valid = a_npz < len(eig_full)
                     common_csv = common_csv[valid]
                     scores = eig_full[a_npz[valid]]
@@ -247,7 +278,7 @@ if loaded and ABC and library is not None:
         if len(set(ABC)) >= 2:
             try:
                 paths = tuple((s["path"], s["key"]) for s in sl_subset)
-                idxs = tuple(tuple(s["csv_to_npz"][common_csv].tolist()) for s in sl_subset)
+                idxs = tuple(tuple(s["attr_csv_to_npz"][common_csv].tolist()) for s in sl_subset)
                 scores = _dev_aligned(paths, idxs)
                 score_label = f"dev_from_shared({', '.join(short_name(s['name']) for s in sl_subset)})"
             except Exception as e:
@@ -371,7 +402,7 @@ if len(display_full_name) > NAME_MAX:
 
 cols = st.columns(len(display_slots))
 for col, s in zip(cols, display_slots):
-    npz_idx = int(s["csv_to_npz"][sel_csv])
+    npz_idx = int(s["attr_csv_to_npz"][sel_csv])
     pred = float(s["predictions"][npz_idx]) if s["predictions"] is not None and 0 <= npz_idx < len(s["predictions"]) else float("nan")
     meas_col = s.get("log2fc_col", "")
     meas = float(row[meas_col]) if meas_col and meas_col in library.columns else float("nan")
@@ -387,7 +418,7 @@ seq_full = str(row.get("sequence", "") or "")
 
 st.markdown("#### Attribution logos")
 for s in display_slots:
-    npz_idx = int(s["csv_to_npz"][sel_csv])
+    npz_idx = int(s["attr_csv_to_npz"][sel_csv])
     if npz_idx < 0:
         st.warning(f"{short_name(s['name'])}: no attribution for this CSV row.")
         continue
@@ -401,7 +432,12 @@ for s in display_slots:
         continue
     attr_L = attr.shape[2]
     wt_oh = seq_to_onehot(seq_full, length=attr_L) if show_wt_logo else None
-    raw_hits = s["finemo"].get(npz_idx, []) if s.get("finemo") else []
+    pid_map = s.get("finemo_csv_to_pid")
+    if pid_map is not None:
+        finemo_pid = int(pid_map[sel_csv])
+    else:
+        finemo_pid = npz_idx  # fallback (only correct when npz and finemo orderings agree)
+    raw_hits = s["finemo"].get(finemo_pid, []) if s.get("finemo") and finemo_pid >= 0 else []
     hits = _hits_to_local(
         raw_hits,
         float(row.get("start_hg38", float("nan"))),

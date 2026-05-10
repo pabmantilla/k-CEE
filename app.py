@@ -23,7 +23,7 @@ from kcee_ui.data import load_library, seq_to_onehot
 from kcee_ui.finemo import load_finemo_hits
 from kcee_ui.defaults import (
     DEFAULT_SLOTS, DEFAULT_LIBRARY_CSV, DATA_SOURCES,
-    MODEL_CT_OPTIONS, slots_for_cell_type,
+    MODEL_CT_OPTIONS, slots_for_cell_type, infer_insert_offset,
 )
 from kcee_ui.cache import mmap_array, cached_npy, cache_dir, cache_size_mb, clear_cache, _mtime, load_attr_row
 
@@ -73,36 +73,45 @@ def _cached_library(path: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="building library one-hot…")
-def _cached_csv_onehot(csv_path: str, attr_L: int) -> np.ndarray:
-    """(N_csv, 4, attr_L) one-hot built from library['sequence']. NaN
-    sequences become zero rows. Cached per (csv_path, attr_L)."""
+def _cached_csv_onehot(csv_path: str, attr_L: int, insert_offset: int) -> np.ndarray:
+    """(N_csv, 4, attr_L) one-hot built from library['sequence'], where
+    column 0 corresponds to insert position `insert_offset`. NaN sequences
+    become zero rows. Cached per (csv_path, attr_L, insert_offset)."""
     lib = _cached_library(csv_path)
     seqs = lib["sequence"].values
     n = len(seqs)
     out = np.zeros((n, 4, attr_L), dtype=np.float32)
     for i, s in enumerate(seqs):
         if isinstance(s, str) and s:
-            out[i] = seq_to_onehot(s, length=attr_L)
+            out[i] = seq_to_onehot(s, length=attr_L, offset=insert_offset)
     return out
 
 
 @st.cache_data(show_spinner="projecting attributions to importance…")
 def _cached_importance(path: str, key: str, csv_path: str,
-                       map_hash: str, _csv_to_npz: np.ndarray) -> np.ndarray:
+                       map_hash: str, insert_offset: int,
+                       _csv_to_npz: np.ndarray) -> np.ndarray:
     """(N_npz, L) importance for a slot. Built from raw attribution and the
-    library one-hot reordered into npz row order via attr_csv_to_npz."""
-    deps = (path, key, _mtime(path), csv_path, map_hash)
+    library one-hot reordered into npz row order via attr_csv_to_npz.
+    `insert_offset` aligns the library 230bp insert with the saved attribution
+    coordinates (see defaults.py and .ui-guy/wt_alignment.md)."""
+    deps = (path, key, _mtime(path), csv_path, map_hash, int(insert_offset), "v2")
 
     def _go():
         attr = np.asarray(_cached_load(path, key))  # (N_npz, 4, L)
         attr_L = int(attr.shape[2])
-        oh_csv = _cached_csv_onehot(csv_path, attr_L)  # (N_csv, 4, L)
+        oh_csv = _cached_csv_onehot(csv_path, attr_L, int(insert_offset))  # (N_csv, 4, L)
         n_npz = int(attr.shape[0])
         oh_npz = np.zeros((n_npz, 4, attr_L), dtype=np.float32)
         ok = _csv_to_npz >= 0
         csv_idx = np.nonzero(ok)[0]
         npz_idx = _csv_to_npz[ok]
         oh_npz[npz_idx] = oh_csv[csv_idx]
+        # Replace NaN attribution rows with zeros so NaN doesn't poison
+        # downstream scores. (See .ui-guy/nan_rows.md.) The per-row plot path
+        # detects NaN separately and surfaces a warning.
+        if not np.isfinite(attr).all():
+            attr = np.where(np.isfinite(attr), attr, np.float32(0.0))
         return attr_to_importance(attr, oh_npz).astype(np.float32)
 
     return cached_npy("importance", deps, _go)
@@ -310,23 +319,65 @@ def _map_hash(arr: np.ndarray) -> str:
     return hashlib.sha1(np.ascontiguousarray(arr, dtype=np.int64).tobytes()).hexdigest()[:16]
 
 
+def _var_window(insert_offset: int, attr_L: int) -> tuple[int, int]:
+    """Var region (200 bp = insert[15:215]) expressed in attribution-array
+    coordinates given a slot's insert_offset and attribution length.
+
+    Koo lab / LegNet (var-only saved): insert_offset=15, attr_L=200 -> (0, 200).
+    Pablo full construct:              insert_offset=0,  attr_L=281 -> (15, 215).
+    Pablo var-only regen (when it lands at attr_L=200): insert_offset=15 -> (0, 200).
+    """
+    lo = max(0, 15 - int(insert_offset))
+    hi = min(int(attr_L), lo + 200)
+    return lo, hi
+
+
+def _resolve_insert_offset(slot: dict, attr_L: int) -> int:
+    """Pick insert_offset per slot. attr_L (read from the file) takes
+    precedence: a slot whose static `insert_offset` predicts a different
+    layout than the file actually has gets corrected at runtime so we don't
+    silently misalign when an attribution file is regenerated with a new
+    layout (e.g. Pablo models switching 281 -> 200).
+    """
+    inferred = infer_insert_offset(int(attr_L))
+    declared = slot.get("insert_offset")
+    if declared is None:
+        return inferred
+    declared = int(declared)
+    if declared != inferred:
+        return inferred
+    return declared
+
+
+def _slot_var_window(slot: dict) -> tuple[int, int]:
+    attr_L = int(_cached_attr_shape(slot["path"], slot["key"])[2])
+    return _var_window(_resolve_insert_offset(slot, attr_L), attr_L)
+
+
 @st.cache_data(show_spinner="computing cossim…")
 def _cossim_full(path_a: str, key_a: str, path_b: str, key_b: str,
                  csv_path: str, a_map_hash: str, b_map_hash: str,
+                 ins_off_a: int, ins_off_b: int,
                  _a_map: np.ndarray, _b_map: np.ndarray) -> np.ndarray:
-    """Per-CSV-row cossim on z-normalized importance over the enhancer.
-    NaN where either slot doesn't cover the row."""
+    """Per-CSV-row cossim on z-normalized importance over the var region
+    (the slice is computed per-slot from insert_offset). NaN where either
+    slot doesn't cover the row."""
     deps = ("cossim_imp", path_a, key_a, _mtime(path_a),
             path_b, key_b, _mtime(path_b),
-            csv_path, a_map_hash, b_map_hash)
+            csv_path, a_map_hash, b_map_hash,
+            int(ins_off_a), int(ins_off_b), "v2")
 
     def _go():
-        imp_a = _cached_importance(path_a, key_a, csv_path, a_map_hash, _a_map)
-        imp_b = _cached_importance(path_b, key_b, csv_path, b_map_hash, _b_map)
+        imp_a = _cached_importance(path_a, key_a, csv_path, a_map_hash, int(ins_off_a), _a_map)
+        imp_b = _cached_importance(path_b, key_b, csv_path, b_map_hash, int(ins_off_b), _b_map)
+        a_lo, a_hi = _var_window(int(ins_off_a), int(imp_a.shape[1]))
+        b_lo, b_hi = _var_window(int(ins_off_b), int(imp_b.shape[1]))
         common = (_a_map >= 0) & (_b_map >= 0)
         out = np.full(_a_map.shape[0], np.nan, dtype=np.float32)
         if int(common.sum()) > 0:
-            out[common] = cossim_score(imp_a[_a_map[common]], imp_b[_b_map[common]])
+            sub_a = imp_a[_a_map[common]][:, a_lo:a_hi]
+            sub_b = imp_b[_b_map[common]][:, b_lo:b_hi]
+            out[common] = cossim_score(sub_a, sub_b, start=0, stop=min(sub_a.shape[1], sub_b.shape[1]))
         return out
 
     return cached_npy("cossim_full", deps, _go)
@@ -335,39 +386,59 @@ def _cossim_full(path_a: str, key_a: str, path_b: str, key_b: str,
 @st.cache_data(show_spinner="computing eigenMaps…")
 def _eigenmaps_full(path_a: str, key_a: str, path_b: str, key_b: str,
                     csv_path: str, a_map_hash: str, b_map_hash: str,
+                    ins_off_a: int, ins_off_b: int,
                     _a_map: np.ndarray, _b_map: np.ndarray) -> np.ndarray:
     """Per-CSV-row EigenMaps[var_ratio*r] on z-normalized importance over
-    the enhancer. NaN where either slot doesn't cover the row."""
+    the var region (per-slot). NaN where either slot doesn't cover the row."""
     deps = ("eig_imp", path_a, key_a, _mtime(path_a),
             path_b, key_b, _mtime(path_b),
-            csv_path, a_map_hash, b_map_hash)
+            csv_path, a_map_hash, b_map_hash,
+            int(ins_off_a), int(ins_off_b), "v2")
 
     def _go():
-        imp_a = _cached_importance(path_a, key_a, csv_path, a_map_hash, _a_map)
-        imp_b = _cached_importance(path_b, key_b, csv_path, b_map_hash, _b_map)
+        imp_a = _cached_importance(path_a, key_a, csv_path, a_map_hash, int(ins_off_a), _a_map)
+        imp_b = _cached_importance(path_b, key_b, csv_path, b_map_hash, int(ins_off_b), _b_map)
+        a_lo, a_hi = _var_window(int(ins_off_a), int(imp_a.shape[1]))
+        b_lo, b_hi = _var_window(int(ins_off_b), int(imp_b.shape[1]))
         common = (_a_map >= 0) & (_b_map >= 0)
         out = np.full(_a_map.shape[0], np.nan, dtype=np.float32)
         if int(common.sum()) > 0:
-            out[common] = eigenmaps_score(imp_a[_a_map[common]], imp_b[_b_map[common]])
+            sub_a = imp_a[_a_map[common]][:, a_lo:a_hi]
+            sub_b = imp_b[_b_map[common]][:, b_lo:b_hi]
+            out[common] = eigenmaps_score(sub_a, sub_b, start=0, stop=min(sub_a.shape[1], sub_b.shape[1]))
         return out
 
     return cached_npy("eigenmaps_full", deps, _go)
 
 
 @st.cache_data(show_spinner="computing dev_from_shared…")
-def _dev_full(paths: tuple[tuple[str, str], ...], map_hashes: tuple[str, ...],
+def _dev_full(paths: tuple[tuple[str, str], ...], csv_path: str,
+              map_hashes: tuple[str, ...], insert_offsets: tuple[int, ...],
               _maps: tuple[np.ndarray, ...]) -> np.ndarray:
-    """Per-CSV-row deviation, NaN where any slot doesn't cover the row."""
-    deps = tuple((p, k, _mtime(p), mh) for (p, k), mh in zip(paths, map_hashes)) + (len(_maps),)
+    """Per-CSV-row deviation on WT×attr importance over the var region
+    (sliced per-slot from insert_offset). NaN where any slot doesn't cover
+    the row. Matches cossim/eigenmaps: (N, L) importance, not (N, 4, L)."""
+    deps = ("dev_imp",) + tuple((p, k, _mtime(p), mh, int(off))
+                                 for (p, k), mh, off in zip(paths, map_hashes, insert_offsets)) \
+                       + (csv_path, len(_maps), "v3")
 
     def _go():
-        arrs_full = [np.asarray(_cached_load(p, k)) for (p, k) in paths]
+        imps_full: list[np.ndarray] = []
+        for (p, k), mh, off, m in zip(paths, map_hashes, insert_offsets, _maps):
+            imp = _cached_importance(p, k, csv_path, mh, int(off), m)
+            lo, hi = _var_window(int(off), int(imp.shape[1]))
+            imps_full.append(imp[:, lo:hi])
         common = np.ones(_maps[0].shape[0], dtype=bool)
         for m in _maps:
             common &= (m >= 0)
         out = np.full(_maps[0].shape[0], np.nan, dtype=np.float32)
         if int(common.sum()) > 0:
-            sub = [a[m[common]] for a, m in zip(arrs_full, _maps)]
+            sub = [imp[m[common]] for imp, m in zip(imps_full, _maps)]
+            # NaN rows -> 0 so they don't poison the shared-direction calc.
+            sub = [np.where(np.isfinite(x), x, np.float32(0.0)) for x in sub]
+            # Trim to the shortest var window so all stacks line up.
+            min_L = min(s.shape[1] for s in sub)
+            sub = [s[:, :min_L] for s in sub]
             out[common] = deviation_from_shared(sub)
         return out
 
@@ -392,10 +463,13 @@ if loaded and ABC and library is not None:
             try:
                 a_map = a["attr_csv_to_npz"]
                 b_map = b["attr_csv_to_npz"]
+                a_L = int(_cached_attr_shape(a["path"], a["key"])[2])
+                b_L = int(_cached_attr_shape(b["path"], b["key"])[2])
                 scores_full = _cossim_full(
                     a["path"], a["key"], b["path"], b["key"],
                     csv_path,
                     _map_hash(a_map), _map_hash(b_map),
+                    _resolve_insert_offset(a, a_L), _resolve_insert_offset(b, b_L),
                     a_map, b_map,
                 )
                 scores = scores_full[common_csv]
@@ -408,10 +482,13 @@ if loaded and ABC and library is not None:
             try:
                 a_map = a["attr_csv_to_npz"]
                 b_map = b["attr_csv_to_npz"]
+                a_L = int(_cached_attr_shape(a["path"], a["key"])[2])
+                b_L = int(_cached_attr_shape(b["path"], b["key"])[2])
                 scores_full = _eigenmaps_full(
                     a["path"], a["key"], b["path"], b["key"],
                     csv_path,
                     _map_hash(a_map), _map_hash(b_map),
+                    _resolve_insert_offset(a, a_L), _resolve_insert_offset(b, b_L),
                     a_map, b_map,
                 )
                 scores = scores_full[common_csv]
@@ -425,7 +502,11 @@ if loaded and ABC and library is not None:
                 paths = tuple((s["path"], s["key"]) for s in sl_subset)
                 maps = tuple(s["attr_csv_to_npz"] for s in sl_subset)
                 map_hashes = tuple(_map_hash(m) for m in maps)
-                scores_full = _dev_full(paths, map_hashes, maps)
+                insert_offsets = tuple(
+                    _resolve_insert_offset(s, int(_cached_attr_shape(s["path"], s["key"])[2]))
+                    for s in sl_subset
+                )
+                scores_full = _dev_full(paths, csv_path, map_hashes, insert_offsets, maps)
                 scores = scores_full[common_csv]
                 score_label = f"dev_from_shared({', '.join(short_name(s['name']) for s in sl_subset)})"
                 score_cmap = "Turbo"
@@ -448,17 +529,28 @@ with st.sidebar.expander("Cache", expanded=False):
         st.success(f"Cleared {n} files. Restart to rebuild.")
 
 
-def _hits_to_local(hits, start_hg38, attr_L):
-    """Per ctcf_focus.ipynb: x = hit.start - start_hg38. No pad, no strand mirror."""
+def _hits_to_local(hits, start_hg38, attr_L, insert_offset: int = 0):
+    """Convert finemo hits (genomic coords) to attribution-array coords.
+
+    `start_hg38` marks the genomic start of the 200bp variable region (per the
+    library CSV — stop_hg38-start_hg38 ~= 200). So `hit.start - start_hg38`
+    gives the hit position in var coords. To land in attribution-array coords
+    we add `(15 - insert_offset)` (the var offset within the saved attribution):
+        Koo lab / LegNet (insert_offset=15): shift = 0  (attr is var-only)
+        Pablo (insert_offset=0):              shift = 15 (attr is full construct)
+    Hits outside [0, attr_L) are dropped.
+    """
     out = []
     if hits is None or not np.isfinite(start_hg38):
         return out
     peak_start = int(start_hg38)
+    var_in_attr = 15 - int(insert_offset)
     for h in hits:
-        s = int(h["start"]) - peak_start
-        e = int(h["end"]) - peak_start
-        if 0 <= s < attr_L and e > s:
-            out.append({**h, "start": s, "end": min(e, attr_L)})
+        s = int(h["start"]) - peak_start + var_in_attr
+        e = int(h["end"]) - peak_start + var_in_attr
+        if e <= 0 or s >= attr_L:
+            continue
+        out.append({**h, "start": max(0, s), "end": min(e, attr_L)})
     return out
 
 
@@ -942,12 +1034,18 @@ fig = _scatter_fig(
 )
 
 with _center:
+    # Per-mode chart key: when k-condition or slot selection changes, the
+    # scatter's customdata shape/contents change. Reusing a single "scatter"
+    # key across modes leaves Streamlit holding stale selection state, so
+    # clicks (and the red highlight lookup) silently miss in models mode.
+    _abc_tag = "-".join(str(i) for i in ABC) if ABC else "none"
+    _scatter_key = f"scatter__{_slot_key_tag}__{_abc_tag}"
     event = st.plotly_chart(
         fig,
         use_container_width=False,
         on_select="rerun",
         selection_mode=("points",),
-        key="scatter",
+        key=_scatter_key,
     )
 
 
@@ -1018,7 +1116,9 @@ for s in display_slots:
         st.warning(f"{short_name(s['name'])}: npz idx {npz_idx} out of range.")
         continue
     attr_L = attr_shape[2]
-    wt_oh = seq_to_onehot(seq_full, length=attr_L) if show_wt_logo else None
+    insert_offset = _resolve_insert_offset(s, attr_L)
+    var_lo, var_hi = _var_window(insert_offset, attr_L)
+    wt_oh = seq_to_onehot(seq_full, length=attr_L, offset=insert_offset) if show_wt_logo else None
     # Lazy-load finemo only here, on click.
     fm_path = s.get("finemo_tsv", "")
     fm = _cached_finemo(fm_path) if fm_path else {}
@@ -1036,6 +1136,7 @@ for s in display_slots:
         raw_hits,
         float(row.get("start_hg38", float("nan"))),
         attr_L,
+        insert_offset=insert_offset,
     )
     plot_hits = hits if show_finemo_hits else []
     title = f"{s['cell_type']} · {short_name(s['name'])}"
@@ -1043,11 +1144,16 @@ for s in display_slots:
         title += f"  ·  {len(hits)} finemo hits"
     try:
         attr_row = load_attr_row(s["path"], s["key"], npz_idx)
+        if not np.isfinite(attr_row).all():
+            st.warning(f"{short_name(s['name'])}: row {npz_idx} has NaN attribution "
+                       f"(known bad rows for the standardtorch file: 18321, 18322). Skipping plot.")
+            continue
         png = cached_attribution_png(
             path=s["path"], key=s["key"], idx=int(npz_idx),
             hits_signature=(_hits_signature(plot_hits), bool(show_finemo_hits)), show_wt_logo=show_wt_logo,
             attr=attr_row, wt_onehot=wt_oh, hits=plot_hits, title=title,
             proj_only_first=ENHANCER_LEN,
+            crop=(var_lo, var_hi),
         )
     except Exception as e:
         st.error(f"{short_name(s['name'])}: {e}")

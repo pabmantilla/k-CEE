@@ -15,22 +15,29 @@ def load_library(path: str | Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def seq_to_onehot(seq: str, length: int | None = None) -> np.ndarray:
+def seq_to_onehot(seq: str, length: int | None = None, offset: int = 0) -> np.ndarray:
     """ACGT one-hot, channels-first (4, L). Non-ACGT -> zero column.
 
-    If `length` is given, pad/truncate to that length (zero-pad on the right).
+    If `length` is given, the output has `length` columns. `offset` selects
+    which sequence position lands at output column 0 (i.e. the output covers
+    seq[offset : offset + length]). Out-of-range columns are zero.
     """
     if not isinstance(seq, str):
         seq = ""
     L = len(seq)
-    out_L = length if length is not None else L
+    out_L = length if length is not None else max(0, L - offset)
     arr = np.zeros((4, out_L), dtype=np.float32)
-    if L == 0:
+    if L == 0 or out_L == 0:
         return arr
-    idx = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)
+    src_lo = max(0, offset)
+    src_hi = min(L, offset + out_L)
+    if src_hi <= src_lo:
+        return arr
+    dst_lo = src_lo - offset
+    sub = seq[src_lo:src_hi]
+    idx = np.frombuffer(sub.encode("ascii"), dtype=np.uint8)
     j = _BASE_LUT[idx]
     valid = j >= 0
-    n = min(L, out_L)
-    rows = np.nonzero(valid[:n])[0]
-    arr[j[rows], rows] = 1.0
+    cols = np.nonzero(valid)[0]
+    arr[j[cols], cols + dst_lo] = 1.0
     return arr

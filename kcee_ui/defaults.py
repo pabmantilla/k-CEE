@@ -1,179 +1,276 @@
 """Default paths + per-slot model identities for the k-CEE attribution browser.
 
-These match the AlphaGenome MPRAMoCon checkpoints used in the parent project
-(see eigen-interactions/eigen_steering.py and the EigenMap notebooks).
-Override any of them via env vars.
+Reads from the canonical attribution tree under `kcee-ui/data/attributions/`,
+built by `tools/build_attributions.py`. Every file is (56975, 4, 200) with key
+`/attr` + `/predictions`, indexed by `data/attributions/manifest.csv` (which is
+joint_library_combined.csv restricted to the 56,975-row intersection set).
+
+Override any path via env vars (`KCEE_ATTR_DIR`, `KCEE_LIBRARY_CSV`, etc.).
+
+Model "families" (Koo lab models / Pablo models / MPRA-LegNet) are the unit of
+the data-source picker. Within each family we enumerate (cell_type, method)
+slots whose H5 actually exists on disk — the sidebar uses these helpers to
+hide unavailable methods/cts rather than disabling them. As soon as a new
+attribution file lands (e.g. once the in-flight Pablo+IntGrad and
+LegNet+IntGrad sweeps merge), it shows up in the picker without code changes.
 """
 import os
+import re
+from pathlib import Path
 
+# Upstream repo retained for non-attribution artifacts (motif hits, full library
+# CSV used by the parent project's notebooks).
 _REPO = "/grid/koo/home/pmantill/projects/Virtual_Experiments/Hippo_axis/Hippo_dependency_mpra"
 
-_ATTR_NPZ = f"{_REPO}/genomic_targets/data/deeplift_attributions_standardtorch.npz"
-_ATTR_H5  = f"{_REPO}/genomic_targets/data/deeplift_attributions_standardtorch.h5"
-DEFAULT_ATTR_FILE = os.environ.get("KCEE_ATTR_FILE",
-                                    _ATTR_H5 if os.path.exists(_ATTR_H5) else _ATTR_NPZ)
+# Canonical attribution dir bundled inside kcee-ui.
+_ATTR_DIR = Path(os.environ.get(
+    "KCEE_ATTR_DIR",
+    str(Path(__file__).resolve().parents[1] / "data" / "attributions"),
+))
 
-# Older AlphaGenome (eigen-interactions, v6_do0X ckpts) attributions.
-_PABLO_NPZ = f"{_REPO}/genomic_targets/data/deeplift_attributions.npz"
-_PABLO_H5  = f"{_REPO}/genomic_targets/data/deeplift_attributions.h5"
-PABLO_ATTR_FILE = os.environ.get("KCEE_PABLO_ATTR_FILE",
-                                  _PABLO_H5 if os.path.exists(_PABLO_H5) else _PABLO_NPZ)
+_KOO_DIR    = _ATTR_DIR / "koo_standardtorch"
+_PABLO_DIR  = _ATTR_DIR / "pablo_ag_ft"
+_LEGNET_DIR = _ATTR_DIR / "legnet_ensemble"
 
-DEFAULT_LIBRARY_CSV = os.environ.get("KCEE_LIBRARY_CSV", f"{_REPO}/data/joint_library_combined.csv")
+# Manifest = the 56,975-row library subset that every canonical attribution
+# file is indexed against. The UI defaults to this so positional indexing
+# Just Works across all sources. Override via KCEE_LIBRARY_CSV to switch back
+# to the upstream 56,980-row library (e.g. for ad-hoc inspection).
+DEFAULT_LIBRARY_CSV = os.environ.get(
+    "KCEE_LIBRARY_CSV", str(_ATTR_DIR / "manifest.csv"),
+)
 
-_LEGNET_DIR = f"{_REPO}/legnet_rep/results"
-_LEGNET_HEPG2 = f"{_LEGNET_DIR}/attrs_HepG2.h5"
-_LEGNET_K562  = f"{_LEGNET_DIR}/attrs_K562.h5"
-
-# Standardized AlphaGenome encoder ckpts used to produce
-# deeplift_attributions_standardtorch.{npz,h5}. The model labels match the
-# directory names under /grid/koo/home/shared/models/alphagenome_encoder/torch.
-#
-# `insert_offset`: position in the 230bp library insert that corresponds to
-# attr position 0. Koo lab attrs are saved var-only ((N,4,200) = insert[15:215])
-# so insert_offset=15. See .ui-guy/wt_alignment.md.
-DEFAULT_SLOTS: list[dict] = [
-    {
-        "cell_type": "HepG2",
-        "model": "mpra_HepG2",
-        "key": "attr_HepG2",
-        "pred_key": "predictions_HepG2",
-        "log2fc_col": "HepG2_log2FC",
-        "path": DEFAULT_ATTR_FILE,
-        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/HepG2/hits.tsv",
-        "insert_offset": 15,
-    },
-    {
-        "cell_type": "K562",
-        "model": "mpra_K562",
-        "key": "attr_K562",
-        "pred_key": "predictions_K562",
-        "log2fc_col": "K562_log2FC",
-        "path": DEFAULT_ATTR_FILE,
-        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/K562/hits.tsv",
-        "insert_offset": 15,
-    },
-    {
-        "cell_type": "WTC11",
-        "model": "mpra_WTC11",
-        "key": "attr_WTC11",
-        "pred_key": "predictions_WTC11",
-        "log2fc_col": "WTC11_log2FC",
-        "path": DEFAULT_ATTR_FILE,
-        "finemo_tsv": "",
-        "insert_offset": 15,
-    },
-]
-
-# MPRA-LegNet attribution maps: per-cell-line h5, no WTC11.
-# Each h5 has datasets `attributions` (N, 4, 200) and `predictions` (N,).
-# Var-only saved (insert[15:215]); insert_offset=15.
-LEGNET_SLOTS: list[dict] = [
-    {
-        "cell_type": "HepG2",
-        "model": "mpra_legnet_HepG2",
-        "key": "attributions",
-        "pred_key": "predictions",
-        "log2fc_col": "HepG2_log2FC",
-        "path": _LEGNET_HEPG2,
-        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/HepG2/hits.tsv",
-        "insert_offset": 15,
-    },
-    {
-        "cell_type": "K562",
-        "model": "mpra_legnet_K562",
-        "key": "attributions",
-        "pred_key": "predictions",
-        "log2fc_col": "K562_log2FC",
-        "path": _LEGNET_K562,
-        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/K562/hits.tsv",
-        "insert_offset": 15,
-    },
-]
-
-# Older AlphaGenome attributions (eigen-interactions pipeline, v6_do0X ckpts).
-# Kept selectable for cross-model comparison; UI label is "Pablo models".
-# Saved over the full 281bp construct (insert(230)+prom(36)+bar(15)); insert
-# starts at construct position 0, so insert_offset=0.
-PABLO_SLOTS: list[dict] = [
-    {
-        "cell_type": "HepG2",
-        "model": "pablo_HepG2_v6_do03",
-        "key": "attr_HepG2",
-        "pred_key": "predictions_HepG2",
-        "log2fc_col": "HepG2_log2FC",
-        "path": PABLO_ATTR_FILE,
-        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/HepG2/hits.tsv",
-        "insert_offset": 0,
-    },
-    {
-        "cell_type": "K562",
-        "model": "pablo_K562_v6_do075",
-        "key": "attr_K562",
-        "pred_key": "predictions_K562",
-        "log2fc_col": "K562_log2FC",
-        "path": PABLO_ATTR_FILE,
-        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/K562/hits.tsv",
-        "insert_offset": 0,
-    },
-    {
-        "cell_type": "WTC11",
-        "model": "pablo_WTC11_twostep_v6_do075",
-        "key": "attr_WTC11",
-        "pred_key": "predictions_WTC11",
-        "log2fc_col": "WTC11_log2FC",
-        "path": PABLO_ATTR_FILE,
-        "finemo_tsv": "",
-        "insert_offset": 0,
-    },
-]
-
-DATA_SOURCES: dict[str, list[dict]] = {
-    "Koo lab models": DEFAULT_SLOTS,
-    "Pablo models": PABLO_SLOTS,
-    "MPRA-LegNet": LEGNET_SLOTS,
+# Display names for attribution methods (the H5 filename uses the lowercase
+# token, the UI shows the pretty form).
+METHOD_DISPLAY = {
+    "deeplift":  "DeepLIFT",
+    "saliency":  "Saliency",
+    "intgrad":   "IntGrad",
 }
+
+
+def _koo_slot(ct: str, *, method: str) -> dict:
+    return {
+        "cell_type": ct,
+        "model": f"koo_{method}_{ct}",
+        "key": "attr",
+        "pred_key": "predictions",
+        "log2fc_col": f"{ct}_log2FC",
+        "path": str(_KOO_DIR / f"{ct}_{method}.h5"),
+        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/{ct}/hits.tsv" if ct != "WTC11" else "",
+        "insert_offset": 15,
+        "method": method,
+        "family": "Koo lab models",
+    }
+
+
+def _pablo_slot(ct: str, *, method: str) -> dict:
+    return {
+        "cell_type": ct,
+        "model": f"pablo_ag_ft_{method}_{ct}",
+        "key": "attr",
+        "pred_key": "predictions",
+        "log2fc_col": f"{ct}_log2FC",
+        "path": str(_PABLO_DIR / f"{ct}_{method}.h5"),
+        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/{ct}/hits.tsv" if ct != "WTC11" else "",
+        "insert_offset": 15,
+        "method": method,
+        "family": "Pablo models",
+    }
+
+
+def _legnet_slot(ct: str, *, method: str) -> dict:
+    return {
+        "cell_type": ct,
+        "model": f"legnet_{method}_{ct}",
+        "key": "attr",
+        "pred_key": "predictions",
+        "log2fc_col": f"{ct}_log2FC",
+        "path": str(_LEGNET_DIR / f"{ct}_{method}.h5"),
+        "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/{ct}/hits.tsv",
+        "insert_offset": 15,
+        "method": method,
+        "family": "MPRA-LegNet",
+    }
+
+
+# Canonical family registry. Order here is the order in the sidebar picker.
+_FAMILY_DEFS: list[tuple[str, callable, list[str], list[str]]] = [
+    # (family name, slot factory, cell types, methods)
+    ("Koo lab models",  _koo_slot,    ["HepG2", "K562", "WTC11"], ["deeplift", "saliency", "intgrad"]),
+    ("Pablo models",    _pablo_slot,  ["HepG2", "K562", "WTC11"], ["deeplift", "saliency", "intgrad"]),
+    ("MPRA-LegNet",     _legnet_slot, ["HepG2", "K562", "WTC11"], ["deeplift", "saliency", "intgrad"]),
+]
+
+
+def _build_families() -> dict[str, list[dict]]:
+    """Enumerate every (family, ct, method) combination whose H5 exists on disk.
+
+    Order: families in _FAMILY_DEFS order; within a family, cell types then
+    methods in declared order."""
+    out: dict[str, list[dict]] = {}
+    for fam_name, factory, cts, methods in _FAMILY_DEFS:
+        slots: list[dict] = []
+        for ct in cts:
+            for m in methods:
+                slot = factory(ct, method=m)
+                if slot.get("path") and os.path.exists(slot["path"]):
+                    slots.append(slot)
+        if slots:
+            out[fam_name] = slots
+    return out
+
+
+FAMILIES: dict[str, list[dict]] = _build_families()
+
+
+# ---- helpers used by the sidebar to build the cascading pickers ----
+
+def family_names() -> list[str]:
+    """Families with at least one (ct, method) slot present on disk."""
+    return list(FAMILIES.keys())
+
+
+def family_slug(family: str) -> str:
+    """Stable slug for session-state keys."""
+    return re.sub(r"[^a-z0-9]+", "_", family.lower()).strip("_")
+
+
+def methods_for_family(family: str) -> list[str]:
+    """Methods (in canonical order) present in any slot of the family."""
+    seen: list[str] = []
+    for s in FAMILIES.get(family, []):
+        m = s.get("method")
+        if m and m not in seen:
+            seen.append(m)
+    return seen
+
+
+def cts_for_family_method(family: str, method: str) -> list[str]:
+    """Cell types for which (family, method) has a slot on disk."""
+    return [s["cell_type"] for s in FAMILIES.get(family, []) if s.get("method") == method]
+
+
+def methods_for_family_ct(family: str, ct: str) -> list[str]:
+    """Methods present at (family, ct)."""
+    return [s["method"] for s in FAMILIES.get(family, []) if s.get("cell_type") == ct]
+
+
+def cts_for_family_with_multiple_methods(family: str) -> list[str]:
+    """Cell types in `family` that have >=2 methods on disk (eligible for the
+    'methods' k-condition mode CT picker). Preserves family declaration order."""
+    out: list[str] = []
+    for s in FAMILIES.get(family, []):
+        ct = s.get("cell_type")
+        if ct and ct not in out and len(methods_for_family_ct(family, ct)) >= 2:
+            out.append(ct)
+    return out
+
+
+def families_with_multiple_methods_anywhere() -> list[str]:
+    """Families that have >=2 methods at >=1 ct (i.e. eligible for the
+    'methods' k-condition mode family picker)."""
+    return [f for f in family_names() if any(
+        len(methods_for_family_ct(f, ct)) >= 2 for ct in
+        {s["cell_type"] for s in FAMILIES.get(f, [])}
+    )]
+
+
+def families_for_ct_method(ct: str, method: str) -> list[str]:
+    """Families that have a slot at (ct, method) on disk."""
+    return [f for f in family_names()
+            if any(s.get("cell_type") == ct and s.get("method") == method
+                   for s in FAMILIES[f])]
+
+
+def methods_at_ct_across_families() -> dict[str, list[str]]:
+    """Per cell-type, the methods that exist in >=2 families (used to populate
+    the method picker in 'models' k-condition mode)."""
+    by_ct: dict[str, list[str]] = {}
+    all_cts: set[str] = set()
+    for slots in FAMILIES.values():
+        for s in slots:
+            all_cts.add(s["cell_type"])
+    for ct in all_cts:
+        methods: list[str] = []
+        for fam in family_names():
+            for m in methods_for_family_ct(fam, ct):
+                if m not in methods:
+                    methods.append(m)
+        # Filter to methods present in >=2 families
+        eligible = [m for m in methods if len(families_for_ct_method(ct, m)) >= 2]
+        if eligible:
+            by_ct[ct] = eligible
+    return by_ct
+
+
+def cts_eligible_for_models_mode() -> list[str]:
+    """Cell types that have at least one method present in >=2 families."""
+    return list(methods_at_ct_across_families().keys())
+
+
+def slot_for(family: str, ct: str, method: str) -> dict | None:
+    for s in FAMILIES.get(family, []):
+        if s.get("cell_type") == ct and s.get("method") == method:
+            return dict(s)
+    return None
+
+
+def slots_for_family_method(family: str, method: str) -> list[dict]:
+    """All (ct) slots for a (family, method) pair — used by 'cell lines' mode."""
+    return [dict(s) for s in FAMILIES.get(family, []) if s.get("method") == method]
+
+
+def slots_for_ct_method(ct: str, method: str) -> list[dict]:
+    """All (family) slots for a (ct, method) pair — used by 'models' mode."""
+    out = []
+    for fam in family_names():
+        s = slot_for(fam, ct, method)
+        if s is not None:
+            out.append(s)
+    return out
+
+
+def slots_for_family_ct(family: str, ct: str) -> list[dict]:
+    """All (method) slots for a (family, ct) pair — used by 'methods' mode."""
+    return [dict(s) for s in FAMILIES.get(family, []) if s.get("cell_type") == ct]
 
 
 def infer_insert_offset(attr_L: int) -> int:
     """Map a saved attribution length back to where attr position 0 sits in the
-    230bp library insert. Lets the UI Do The Right Thing when an attribution
-    file is regenerated with a different layout (e.g. Pablo models switching
-    from 281bp full construct to 200bp var-only via attr_shards_uniform/).
+    230bp library insert. Canonical files are all 200bp var-only (offset 15);
+    fallback retained for non-canonical paths set via KCEE_ATTR_DIR.
 
     200 -> 15  (var-only, attr starts at insert[15])
     230 -> 0   (bare insert)
     281 -> 0   (insert + prom(36) + bar(15); insert is at construct[0:230])
-    other -> 0 (with the explicit slot value overriding via slot.get('insert_offset'))
+    other -> 0
     """
     if attr_L == 200:
         return 15
     return 0
 
 
+# ---- backward-compatibility re-exports ----
+# Nothing outside app.py imports these (verified via grep), but they are cheap
+# and keep one-off scripts / notebooks that might import them working.
+DEFAULT_SLOTS: list[dict] = slots_for_family_method("Koo lab models", "deeplift")
+KOO_SALIENCY_SLOTS: list[dict] = slots_for_family_method("Koo lab models", "saliency")
+KOO_INTGRAD_SLOTS:  list[dict] = slots_for_family_method("Koo lab models", "intgrad")
+PABLO_SLOTS:        list[dict] = slots_for_family_method("Pablo models", "deeplift")
+LEGNET_SLOTS:       list[dict] = slots_for_family_method("MPRA-LegNet", "deeplift")
+
+
 def slots_for_cell_type(ct: str) -> list[dict]:
-    """All slot dicts across data sources whose cell_type matches and whose
-    path exists on disk. Used by the "models" k-condition mode."""
+    """Deprecated: superseded by `slots_for_ct_method`. Returns all slots
+    (across families and methods) for `ct` whose H5 exists. Kept so external
+    callers don't break."""
     out = []
-    for src in (DEFAULT_SLOTS, PABLO_SLOTS, LEGNET_SLOTS):
-        for s in src:
-            if s.get("cell_type") == ct and s.get("path") and os.path.exists(s["path"]):
+    for fam in family_names():
+        for s in FAMILIES[fam]:
+            if s.get("cell_type") == ct:
                 out.append(dict(s))
     return out
 
 
-def _model_ct_options() -> list[str]:
-    """Cell types that appear in >=2 sources (i.e. eligible for cross-model
-    comparison)."""
-    cts: dict[str, int] = {}
-    for src in (DEFAULT_SLOTS, PABLO_SLOTS, LEGNET_SLOTS):
-        seen = set()
-        for s in src:
-            ct = s.get("cell_type")
-            if ct and ct not in seen and s.get("path") and os.path.exists(s["path"]):
-                cts[ct] = cts.get(ct, 0) + 1
-                seen.add(ct)
-    return [ct for ct, n in cts.items() if n >= 2]
-
-
-MODEL_CT_OPTIONS: list[str] = _model_ct_options() or ["HepG2", "K562"]
+MODEL_CT_OPTIONS: list[str] = cts_eligible_for_models_mode() or ["HepG2", "K562"]

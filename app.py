@@ -8,6 +8,7 @@ Run:
     uv run streamlit run app.py
 """
 import hashlib
+import re
 from functools import reduce
 from pathlib import Path
 import numpy as np
@@ -22,17 +23,89 @@ from kcee_ui.plotting import plot_attribution, cached_attribution_png
 from kcee_ui.data import load_library, seq_to_onehot
 from kcee_ui.finemo import load_finemo_hits
 from kcee_ui.defaults import (
-    DEFAULT_SLOTS, DEFAULT_LIBRARY_CSV, DATA_SOURCES,
-    MODEL_CT_OPTIONS, slots_for_cell_type, infer_insert_offset,
+    DEFAULT_LIBRARY_CSV, infer_insert_offset, METHOD_DISPLAY,
+    family_names, family_slug, methods_for_family,
+    families_with_multiple_methods_anywhere, cts_for_family_with_multiple_methods,
+    slots_for_family_method, slots_for_ct_method, slots_for_family_ct,
+    cts_eligible_for_models_mode, methods_at_ct_across_families,
 )
 from kcee_ui.cache import mmap_array, cached_npy, cache_dir, cache_size_mb, clear_cache, _mtime, load_attr_row
 from kcee_ui.alignment import csv_to_npz_for_slot, assert_slot_aligned, assert_pair_aligned, AlignmentError
 
 
 st.set_page_config(page_title="k-CEE attribution browser", layout="wide")
-st.title("k-CEE attribution browser")
 
-N_SLOTS = 3
+# Center the default Streamlit "Running…" status widget and replace its
+# contents with a large circular CSS spinner so the load-up indicator is
+# obvious instead of a tiny top-right badge / thin white bar.
+st.markdown(
+    """
+    <style>
+    @keyframes kcee-spin { to { transform: rotate(360deg); } }
+    [data-testid="stStatusWidget"] {
+        position: fixed !important;
+        top: 50% !important;
+        left: 50% !important;
+        right: auto !important;
+        transform: translate(-50%, -50%) !important;
+        z-index: 999999 !important;
+        background: rgba(255, 255, 255, 0.97) !important;
+        padding: 28px 36px 22px !important;
+        border-radius: 14px !important;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.20) !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 12px !important;
+        min-width: 160px !important;
+    }
+    /* Hide the default tiny icon/text Streamlit puts inside the widget. */
+    [data-testid="stStatusWidget"] > div { all: unset !important; }
+    [data-testid="stStatusWidget"] svg,
+    [data-testid="stStatusWidget"] button { display: none !important; }
+    /* The circular spinner itself. */
+    [data-testid="stStatusWidget"]::before {
+        content: "";
+        display: block;
+        width: 56px;
+        height: 56px;
+        border: 6px solid #e6e6e6;
+        border-top-color: #ff4b4b;
+        border-radius: 50%;
+        animation: kcee-spin 0.9s linear infinite;
+    }
+    [data-testid="stStatusWidget"]::after {
+        content: "Loading…";
+        font-size: 0.95rem;
+        color: #444;
+        font-weight: 500;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+_title_col, _mode_col = st.columns([5, 1])
+with _title_col:
+    st.title("k-CEE attribution browser")
+    # Filled after the sidebar pickers resolve so the tag reflects the current
+    # (family / cell type / method) selection.
+    _title_tag_slot = st.empty()
+with _mode_col:
+    st.write("")  # vertical padding so the radio lines up with the title row
+    app_mode = st.radio(
+        "mode", ["kcee", "SEAM"], index=0, horizontal=True, key="app_mode",
+        label_visibility="collapsed",
+        help="kcee: per-row attribution browser across families/methods/cell lines. "
+             "SEAM: foreground/background viewer for the 1059-seq SEAM space (Pablo's AG models, HepG2+K562 only).",
+    )
+
+if app_mode == "SEAM":
+    from kcee_ui import seam
+    seam.render()
+    st.stop()
+
 ENHANCER_LEN = 230
 NAME_MAX = 24
 
@@ -137,11 +210,14 @@ def _cached_finemo(tsv_path: str) -> dict[int, list[dict]]:
 
 # --- sidebar: k-condition ---
 k_condition = st.sidebar.selectbox(
-    "k-condition", ["cell lines", "models"], index=0, key="k_condition",
-    help="'cell lines' compares attribution maps across cell lines for one model. "
-         "'models' compares different models on the same cell line.",
+    "k-condition", ["cell lines", "models", "methods"], index=0, key="k_condition",
+    help="'cell lines' fixes (family, method), varies cell line. "
+         "'models' fixes (cell line, method), varies model family. "
+         "'methods' fixes (family, cell line), varies attribution method.",
 )
-MODE_MODELS = (k_condition == "models")
+# Single-cell-type modes share downstream label/axis logic with the original
+# 'models' mode; cell-lines mode is the odd one out.
+MODE_MODELS = (k_condition != "cell lines")
 
 
 # --- sidebar: library ---
@@ -154,71 +230,103 @@ library: pd.DataFrame | None = None
 library_load_error: str | None = None
 
 
-# --- sidebar: data source + model slots ---
+# --- sidebar: family / cell type / method pickers ---
+# Each k-condition fixes two of (family, cell type, method) via dropdowns and
+# leaves the third varying — that's the A/B/C axis. Pickers are filtered to
+# combinations whose H5 actually exists on disk; method is not a "data source"
+# but an axis, so the per-method Koo entries no longer appear at the top level.
 models_ct: str | None = None
-if MODE_MODELS:
-    st.sidebar.header("Cell type")
-    models_ct = st.sidebar.selectbox(
-        "cell type", MODEL_CT_OPTIONS, index=0, key="models_ct",
-        help="Eligible cell types have >=2 attribution sources.",
-    )
-    _source_slots = slots_for_cell_type(models_ct)
-    _slot_key_tag = f"models_{models_ct}"
-    st.sidebar.header("Available models")
-    if len(_source_slots) < 2:
-        st.sidebar.warning(f"Only {len(_source_slots)} source(s) for {models_ct}.")
-else:
-    st.sidebar.header("Data source")
-    _source_names = list(DATA_SOURCES.keys())
-    data_source = st.sidebar.selectbox("attribution dataset", _source_names, index=0, key="data_source")
-    _source_slots = DATA_SOURCES[data_source]
-    _slot_key_tag = data_source.split()[0].lower()  # "alphagenome" / "mpra-legnet"
-    st.sidebar.header("Available models")
+_source_slots: list[dict] = []
+_slot_key_tag: str = "empty"
+_title_tag: str = ""
+if k_condition == "cell lines":
+    fams = family_names()
+    if not fams:
+        st.sidebar.error("No attribution families found on disk.")
+    else:
+        st.sidebar.header("Family")
+        family = st.sidebar.selectbox("model family", fams, index=0, key="family_cl")
+        method_opts = methods_for_family(family)
+        st.sidebar.header("Method")
+        method = st.sidebar.selectbox(
+            "attribution method", method_opts, index=0,
+            format_func=lambda m: METHOD_DISPLAY.get(m, m),
+            key=f"method_cl__{family_slug(family)}",
+        )
+        _source_slots = slots_for_family_method(family, method)
+        _slot_key_tag = f"cl__{family_slug(family)}__{method}"
+        _title_tag = f"{family} · {METHOD_DISPLAY.get(method, method)} · comparing cell lines"
+elif k_condition == "models":
+    cts = cts_eligible_for_models_mode()
+    if not cts:
+        st.sidebar.warning("No (cell type, method) pair has >=2 families yet.")
+    else:
+        st.sidebar.header("Cell type")
+        models_ct = st.sidebar.selectbox(
+            "cell type", cts, index=0, key="models_ct",
+            help="Cell types with >=1 method present in >=2 families.",
+        )
+        method_opts = methods_at_ct_across_families().get(models_ct, [])
+        st.sidebar.header("Method")
+        method = st.sidebar.selectbox(
+            "attribution method", method_opts, index=0,
+            format_func=lambda m: METHOD_DISPLAY.get(m, m),
+            key=f"method_mdl__{models_ct}",
+        )
+        _source_slots = slots_for_ct_method(models_ct, method)
+        _slot_key_tag = f"mdl__{models_ct}__{method}"
+        _title_tag = f"{models_ct} · {METHOD_DISPLAY.get(method, method)} · comparing models"
+        if len(_source_slots) < 2:
+            st.sidebar.warning(f"Only {len(_source_slots)} family at {models_ct}/{METHOD_DISPLAY.get(method, method)}.")
+else:  # methods
+    fams = families_with_multiple_methods_anywhere()
+    if not fams:
+        st.sidebar.warning("No family has >=2 methods on disk yet.")
+    else:
+        st.sidebar.header("Family")
+        family = st.sidebar.selectbox("model family", fams, index=0, key="family_mth")
+        ct_opts = cts_for_family_with_multiple_methods(family)
+        st.sidebar.header("Cell type")
+        ct = st.sidebar.selectbox(
+            "cell type", ct_opts, index=0,
+            key=f"ct_mth__{family_slug(family)}",
+        )
+        models_ct = ct  # downstream meas/resid logic keys off models_ct
+        _source_slots = slots_for_family_ct(family, ct)
+        _slot_key_tag = f"mth__{family_slug(family)}__{ct}"
+        _title_tag = f"{family} · {ct} · comparing methods"
+if _title_tag:
+    _title_tag_slot.caption(_title_tag)
 
 slots: list[dict] = []
-n_show = len(_source_slots) if MODE_MODELS else max(N_SLOTS, len(_source_slots))
-for i in range(n_show):
-    d = _source_slots[i] if i < len(_source_slots) else {
-        "cell_type": f"slot{i+1}", "model": "", "key": "", "pred_key": "",
-        "log2fc_col": "", "path": "", "finemo_tsv": "",
-    }
-    _label = d.get("model") or d["cell_type"] if MODE_MODELS else d["cell_type"]
-    with st.sidebar.expander(f"Slot {i + 1} — {_label}", expanded=(i < 2)):
-        path = st.text_input("attr file (.npz / .h5)", value=d["path"], key=f"path_{_slot_key_tag}_{i}")
-        finemo_tsv = st.text_input("finemo hits.tsv", value=d.get("finemo_tsv", ""), key=f"fm_{_slot_key_tag}_{i}")
-        if not path or not Path(path).exists():
-            slots.append({**d, "path": "", "predictions": None, "finemo": {}, "n_attr": 0})
-            if path:
-                st.warning("Path not found")
-            continue
-        try:
-            keys = _cached_keys(path)
-        except Exception as e:
-            st.error(f"keys: {e}")
-            slots.append({**d, "path": "", "predictions": None, "finemo": {}, "n_attr": 0})
-            continue
-        if not keys:
-            st.warning("No 3D arrays found")
-            slots.append({**d, "path": "", "predictions": None, "finemo": {}, "n_attr": 0})
-            continue
-        default_key_idx = keys.index(d["key"]) if d["key"] in keys else 0
-        key = st.selectbox("attribution key", keys, index=default_key_idx, key=f"key_{_slot_key_tag}_{i}")
-        name = st.text_input("display name", value=d["model"] or key, key=f"name_{_slot_key_tag}_{i}")
-        # Defer heavy reads (predictions NPZ, finemo TSV) to first real use.
-        # n_attr is needed to build the csv->npz row map; derive it cheaply
-        # from the 3D attribution shape rather than loading predictions here.
-        try:
-            n_attr = int(_cached_attr_shape(path, key)[0])
-        except Exception:
-            n_attr = 0
-        _ext = Path(path).suffix.lower()
-        st.caption(f"attr N={n_attr if n_attr else '—'}  ·  format: {_ext or '—'}")
-        slots.append({**d, "path": path, "key": key, "name": name,
-                      "pred_key": d.get("pred_key", ""),
-                      "finemo_tsv": finemo_tsv,
-                      "n_attr": n_attr})
+for d in _source_slots:
+    path = d.get("path", "")
+    if not path or not Path(path).exists():
+        slots.append({**d, "path": "", "predictions": None, "finemo": {}, "n_attr": 0})
+        continue
+    try:
+        keys = _cached_keys(path)
+    except Exception as e:
+        st.sidebar.error(f"{d.get('model') or d.get('cell_type')}: keys: {e}")
+        slots.append({**d, "path": "", "predictions": None, "finemo": {}, "n_attr": 0})
+        continue
+    if not keys:
+        slots.append({**d, "path": "", "predictions": None, "finemo": {}, "n_attr": 0})
+        continue
+    key = d["key"] if d.get("key") in keys else keys[0]
+    name = d.get("model") or key
+    try:
+        n_attr = int(_cached_attr_shape(path, key)[0])
+    except Exception:
+        n_attr = 0
+    slots.append({**d, "path": path, "key": key, "name": name,
+                  "pred_key": d.get("pred_key", ""),
+                  "finemo_tsv": d.get("finemo_tsv", ""),
+                  "n_attr": n_attr})
 
 loaded = [s for s in slots if s.get("path")]
+if loaded:
+    st.sidebar.caption("Loaded: " + ", ".join(short_name(s["name"]) for s in loaded))
 
 
 # --- per-slot mappings ---
@@ -283,24 +391,79 @@ st.sidebar.header("Comparison")
 dim = st.sidebar.radio("dimension", ["2D", "3D"], horizontal=True)
 
 ABC: list[int] = []  # indices into `loaded`
-display_names = [short_name(s["name"]) for s in loaded]
+# Per-mode label for the A/B/C selectboxes: the varying axis ("cell line" /
+# "family" / "method"). Downstream code still reads s["name"] for plot titles.
+def _picker_label(s: dict) -> str:
+    if k_condition == "cell lines":
+        return s.get("cell_type") or short_name(s["name"])
+    if k_condition == "models":
+        return s.get("family") or short_name(s["name"])
+    if k_condition == "methods":
+        return METHOD_DISPLAY.get(s.get("method"), s.get("method") or short_name(s["name"]))
+    return short_name(s["name"])
+display_names = [_picker_label(s) for s in loaded]
 if loaded:
+    # Re-key per source/cell-type tag so changing the dropdown above resets the
+    # A/B/C selection to the new defaults instead of holding a stale integer
+    # in session_state (which caused A/B to look frozen until clicked).
     if dim == "2D":
         a_idx = st.sidebar.selectbox("A", range(len(loaded)), format_func=lambda i: display_names[i],
-                                     index=0, key="abc_a")
+                                     index=0, key=f"abc_a__{_slot_key_tag}")
         b_idx = st.sidebar.selectbox("B", range(len(loaded)), format_func=lambda i: display_names[i],
-                                     index=min(1, len(loaded) - 1), key="abc_b")
+                                     index=min(1, len(loaded) - 1), key=f"abc_b__{_slot_key_tag}")
         ABC = [a_idx, b_idx]
     else:
         if len(loaded) < 3:
             st.sidebar.warning("3D needs 3 loaded slots.")
         a_idx = st.sidebar.selectbox("A", range(len(loaded)), format_func=lambda i: display_names[i],
-                                     index=0, key="abc_a3")
+                                     index=0, key=f"abc_a3__{_slot_key_tag}")
         b_idx = st.sidebar.selectbox("B", range(len(loaded)), format_func=lambda i: display_names[i],
-                                     index=min(1, len(loaded) - 1), key="abc_b3")
+                                     index=min(1, len(loaded) - 1), key=f"abc_b3__{_slot_key_tag}")
         c_idx = st.sidebar.selectbox("C", range(len(loaded)), format_func=lambda i: display_names[i],
-                                     index=min(2, len(loaded) - 1), key="abc_c3")
+                                     index=min(2, len(loaded) - 1), key=f"abc_c3__{_slot_key_tag}")
         ABC = [a_idx, b_idx, c_idx]
+
+
+# --- sidebar: library annotation (color / filter by any library column) ---
+# Pick any library CSV column (e.g. `category` with values like 'promoter',
+# 'putative enhancer, HepG2') to (a) filter common_csv to a subset and/or
+# (b) color the scatter by that column. Filter applies BEFORE scoring so
+# scores stay aligned to the filtered common_csv.
+annot_col: str | None = None
+annot_filter_mask: np.ndarray | None = None  # bool, length = len(library)
+annot_codes: np.ndarray | None = None        # int32, length = len(library); -1 if NaN
+annot_values: list[str] = []                 # ordered unique values; index = code
+if library is not None:
+    _eligible_annot_cols = [
+        c for c in library.columns
+        if c not in ("sequence", "csv_row", "name")
+        and not c.endswith("_log2FC")
+        and not c.endswith("_hg38")
+        and library[c].nunique(dropna=True) <= 200
+    ]
+    if _eligible_annot_cols:
+        st.sidebar.header("Library annotation")
+        annot_col = st.sidebar.selectbox(
+            "column", ["(none)"] + _eligible_annot_cols, index=0,
+            key=f"annot_col__{_slot_key_tag}",
+            help="Library CSV column for filter/color (e.g. 'category').",
+        )
+        if annot_col == "(none)":
+            annot_col = None
+        if annot_col is not None:
+            annot_values = sorted(library[annot_col].dropna().astype(str).unique().tolist())
+            _picked = st.sidebar.multiselect(
+                f"filter {annot_col} (empty = all)",
+                annot_values, default=[],
+                key=f"annot_vals__{annot_col}",
+            )
+            _vi = {v: i for i, v in enumerate(annot_values)}
+            annot_codes = (
+                library[annot_col].astype("string").map(_vi).fillna(-1).astype("int32").to_numpy()
+            )
+            if _picked:
+                _picked_codes = np.array([_vi[v] for v in _picked if v in _vi], dtype=np.int32)
+                annot_filter_mask = np.isin(annot_codes, _picked_codes)
 
 
 # --- score over common CSV rows ---
@@ -452,6 +615,8 @@ common_csv: np.ndarray = np.array([], dtype=np.int64)
 if loaded and ABC and library is not None:
     sl_subset = [loaded[i] for i in ABC]
     common_csv = _common_csv(sl_subset)
+    if annot_filter_mask is not None and len(common_csv):
+        common_csv = common_csv[annot_filter_mask[common_csv]]
     if dim == "2D":
         score_mode = st.sidebar.selectbox("score (mech axis)", ["cossim", "EigenMaps"], index=0)
         a, b = sl_subset[0], sl_subset[1]
@@ -576,7 +741,13 @@ if scores is None or len(common_csv) == 0:
 
 
 # --- 2D scatter (CSV-row indexed) ---
-if MODE_MODELS and len(ABC) >= 2:
+if k_condition == "methods" and len(ABC) >= 2:
+    # Same model, same cell line — predictions are identical, so there's no
+    # functional axis. Collapse x to 0 to make the methods scatter purely
+    # attribution-driven.
+    x = np.zeros(common_csv.shape[0], dtype=np.float32)
+    _xaxis_label = "(no functional axis — predictions identical across methods)"
+elif MODE_MODELS and len(ABC) >= 2:
     a = loaded[ABC[0]]
     b = loaded[ABC[1]]
     a_pred = _load_pred(a["path"], a["pred_key"]) if a.get("pred_key") else np.array([])
@@ -854,7 +1025,10 @@ with _ctrl:
                         if f"{s['cell_type']}_log2FC" in library.columns]
             resid_cts = [s["cell_type"] for s in (loaded[i] for i in ABC)
                          if s.get("pred_key") and f"{s['cell_type']}_log2FC" in library.columns]
-        _ax_kind = "model" if MODE_MODELS else "cell line"
+        _ax_kind = (
+            "method" if k_condition == "methods"
+            else ("model" if MODE_MODELS else "cell line")
+        )
         _xaxis_color_label = (
             "model prediction difference (x-axis)"
             if MODE_MODELS else "log2FC HepG2 vs K562 (x-axis)"
@@ -867,6 +1041,9 @@ with _ctrl:
             "score (y-axis)",
             _xaxis_color_label,
         ]
+        _CM_ANNOT = f"library: {annot_col}" if annot_col else None
+        if _CM_ANNOT:
+            _COLOR_MODES.append(_CM_ANNOT)
         color_mode = st.selectbox(
             "color by",
             _COLOR_MODES,
@@ -975,6 +1152,11 @@ elif color_mode == "score (y-axis)":
 elif color_mode == _CM_XAXIS:
     _color_arr = np.asarray(x, dtype=np.float32)
     color_label = _xaxis_label.replace("   [func]", "").strip()
+
+elif annot_col and _CM_ANNOT and color_mode == _CM_ANNOT and annot_codes is not None:
+    codes = annot_codes[common_csv].astype(np.float32)
+    _color_arr = np.where(codes < 0, np.nan, codes)
+    color_label = f"library: {annot_col}"
 
 if _color_arr is None:
     sl_subset_for_color = [loaded[i] for i in ABC]
@@ -1096,7 +1278,7 @@ def _hits_signature(hits: list[dict]) -> tuple:
 
 
 st.markdown("#### Attribution logos")
-_need_finemo = any(s.get("finemo_tsv") for s in display_slots)
+_need_finemo = show_finemo_hits and any(s.get("finemo_tsv") for s in display_slots)
 if _need_finemo:
     _name_keys = tuple(library["name"].astype(str).tolist())
     _name_vals = tuple(range(len(library)))
@@ -1117,42 +1299,42 @@ for s in display_slots:
     insert_offset = _resolve_insert_offset(s, attr_L)
     var_lo, var_hi = _var_window(insert_offset, attr_L)
     wt_oh = seq_to_onehot(seq_full, length=attr_L, offset=insert_offset) if show_wt_logo else None
-    # Lazy-load finemo only here, on click.
-    fm_path = s.get("finemo_tsv", "")
-    fm = _cached_finemo(fm_path) if fm_path else {}
-    fm_path_for_pid = s.get("finemo_tsv", "")
-    if fm_path_for_pid:
-        pid_map = _cached_finemo_csv_to_pid(fm_path_for_pid, _name_keys, _name_vals)
+    # Lazy-load finemo only when the user has it enabled.
+    if show_finemo_hits:
+        fm_path = s.get("finemo_tsv", "")
+        fm = _cached_finemo(fm_path) if fm_path else {}
+        if fm_path:
+            pid_map = _cached_finemo_csv_to_pid(fm_path, _name_keys, _name_vals)
+            finemo_pid = int(pid_map[sel_csv])
+        else:
+            finemo_pid = npz_idx  # fallback (only correct when npz and finemo orderings agree)
+        raw_hits = fm.get(finemo_pid, []) if fm and finemo_pid >= 0 else []
+        hits = _hits_to_local(
+            raw_hits,
+            float(row.get("start_hg38", float("nan"))),
+            attr_L,
+            insert_offset=insert_offset,
+        )
     else:
-        pid_map = None
-    if pid_map is not None:
-        finemo_pid = int(pid_map[sel_csv])
-    else:
-        finemo_pid = npz_idx  # fallback (only correct when npz and finemo orderings agree)
-    raw_hits = fm.get(finemo_pid, []) if fm and finemo_pid >= 0 else []
-    hits = _hits_to_local(
-        raw_hits,
-        float(row.get("start_hg38", float("nan"))),
-        attr_L,
-        insert_offset=insert_offset,
-    )
-    plot_hits = hits if show_finemo_hits else []
+        hits = []
+    plot_hits = hits
     title = f"{s['cell_type']} · {short_name(s['name'])}"
     if hits and show_finemo_hits:
         title += f"  ·  {len(hits)} finemo hits"
     try:
-        attr_row = load_attr_row(s["path"], s["key"], npz_idx)
-        if not np.isfinite(attr_row).all():
-            st.warning(f"{short_name(s['name'])}: row {npz_idx} has NaN attribution "
-                       f"(known bad rows for the standardtorch file: 18321, 18322). Skipping plot.")
-            continue
-        png = cached_attribution_png(
-            path=s["path"], key=s["key"], idx=int(npz_idx),
-            hits_signature=(_hits_signature(plot_hits), bool(show_finemo_hits)), show_wt_logo=show_wt_logo,
-            attr=attr_row, wt_onehot=wt_oh, hits=plot_hits, title=title,
-            proj_only_first=ENHANCER_LEN,
-            crop=(var_lo, var_hi),
-        )
+        with st.spinner(f"loading attribution map · {short_name(s['name'])}…"):
+            attr_row = load_attr_row(s["path"], s["key"], npz_idx)
+            if not np.isfinite(attr_row).all():
+                st.warning(f"{short_name(s['name'])}: row {npz_idx} has NaN attribution "
+                           f"(known bad rows for the standardtorch file: 18321, 18322). Skipping plot.")
+                continue
+            png = cached_attribution_png(
+                path=s["path"], key=s["key"], idx=int(npz_idx),
+                hits_signature=(_hits_signature(plot_hits), bool(show_finemo_hits)), show_wt_logo=show_wt_logo,
+                attr=attr_row, wt_onehot=wt_oh, hits=plot_hits, title=title,
+                proj_only_first=ENHANCER_LEN,
+                crop=(var_lo, var_hi),
+            )
     except Exception as e:
         st.error(f"{short_name(s['name'])}: {e}")
         continue

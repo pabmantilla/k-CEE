@@ -1,5 +1,21 @@
 # kcee-ui — version log
 
+## v0.9.4 — 2026-05-11
+- **SEAM: background is the intra-cluster bg, not the scaled avg.** Per `seam_foreground_viewer.ipynb`, the "background" should be `cluster_backgrounds[ref_cluster_idx]` (the entropic-position bg from MetaExplainer at the seq's reference cluster), NOT `average_background_scaled.npy` which was the global cell-type average. New helper `_load_intra_bg(seq_dir)` resolves the ref cluster and slices. Affects both the scatter (cossim-bg) and the rendered maps.
+- Stale cossim-bg numbers from earlier versions are invalidated automatically (Streamlit caches re-hash on function-code change).
+- Files: `kcee_ui/seam.py`.
+
+## v0.9.3 — 2026-05-11
+- **SEAM mode: WT-projected logo toggle.** Sidebar checkbox `WT-projected logo (attr × onehot)` (parity with kcee mode). When on, each rendered map (WT / foreground / background, per cell type) is multiplied by the WT one-hot from `df["sequence"]` so only the WT base at each position survives; titles get a `· WT-projected` tag.
+- Files: `kcee_ui/seam.py`.
+
+## v0.9.2 — 2026-05-11
+- **SEAM scatter gets the same plot-controls panel as kcee mode.** Left-column `Plot controls` box with: `color by` / `colorscale` / `color clipping` (auto 2–98% / manual / full range) / `figure width/height` / `marginal x/y` (none/counts/density/probability) / `auto axis limits` + manual `xmin/xmax/ymin/ymax` / `highlight seq_idx`.
+- **`color by` modes for SEAM:** `by type (WT/fg/bg)` (default — gray/red/blue traces); or per-seq value: `EI_1 var x r`, `log2FC HepG2 − K562`, `log2FC HepG2`, `log2FC K562`, `predicted HepG2`, `predicted K562`, `predicted HepG2 − K562`, `condition`. When colored by value, each visible type still gets its own trace (so type is preserved as marker shape: WT = circle, foreground = △, background = ▽) and the colorscale + colorbar are shared.
+- **Marginals** (counts/density/probability) work over the union of visible points and are color-weighted when a value-based `color by` is active.
+- Reference lines at x=0 and y=0; `highlight seq_idx` draws a red ring around every visible-type point for that sequence.
+- Files: `kcee_ui/seam.py`.
+
 ## v0.9.1 — 2026-05-11
 - **SEAM viewer is now a mech/func scatter** mirroring the kcee browser layout. Each of the 1059 sequences contributes up to 3 points sharing the same x (log2FC HepG2 − K562, measured): **gray WT**, **red foreground (scaled)**, **blue background (avg scaled)**. Y axis = cossim(HepG2 attr, K562 attr) on z-normalised importance over the 200-bp var region.
 - **Sidebar view picker:** `all three` / `foregrounds only` / `backgrounds only` / `WT only`. Sidebar also has a condition filter (`all / diff-diff / same-diff / same-same`).

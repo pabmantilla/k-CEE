@@ -168,7 +168,7 @@ def plot_attribution(
     title: str = "",
     figsize=(14, 1.8),
     proj_only_first: int | None = None,
-    adapter_len: int = 15,
+    crop: tuple[int, int] | None = None,
 ):
     """Plot a (4, L) attribution map as a sequence logo on a white background.
 
@@ -178,15 +178,20 @@ def plot_attribution(
         hits: list of {start, end, motif, strand} in the input attr frame.
         title: figure title.
         proj_only_first: if set, project only the first N positions.
-        adapter_len: trim this many positions from each end of the input
-            (constant cloning adapters in the LentiMPRA construct). Hit
-            coordinates are shifted by -adapter_len and clipped.
+        crop: (start, stop) slice into the input attr/wt_onehot to display.
+            Hit coordinates are shifted by -start and clipped to [0, stop-start].
+            If None, the full attr is shown.
     """
     assert attr.shape[0] == 4, f"Expected (4, L), got {attr.shape}"
-    if adapter_len > 0 and attr.shape[1] > 2 * adapter_len:
-        attr = attr[:, adapter_len:attr.shape[1] - adapter_len]
-        if wt_onehot is not None:
-            wt_onehot = wt_onehot[:, adapter_len:wt_onehot.shape[1] - adapter_len]
+    crop_start = 0
+    if crop is not None:
+        crop_start, crop_stop = int(crop[0]), int(crop[1])
+        crop_start = max(0, crop_start)
+        crop_stop = min(attr.shape[1], crop_stop)
+        if crop_stop > crop_start:
+            attr = attr[:, crop_start:crop_stop]
+            if wt_onehot is not None:
+                wt_onehot = wt_onehot[:, crop_start:crop_stop]
     L = attr.shape[1]
     a = attr.copy()
     if wt_onehot is not None:
@@ -201,11 +206,11 @@ def plot_attribution(
             do_proj = wt_has
         if do_proj.any():
             a[:, do_proj] = a[:, do_proj] * wt[:, do_proj]
-    if hits and adapter_len > 0:
+    if hits and crop_start > 0:
         shifted: list[dict] = []
         for h in hits:
-            s = int(h["start"]) - adapter_len
-            e = int(h["end"]) - adapter_len
+            s = int(h["start"]) - crop_start
+            e = int(h["end"]) - crop_start
             if e <= 0 or s >= L:
                 continue
             shifted.append({**h, "start": max(0, s), "end": min(L, e)})

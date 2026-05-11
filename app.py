@@ -26,6 +26,7 @@ from kcee_ui.defaults import (
     MODEL_CT_OPTIONS, slots_for_cell_type, infer_insert_offset,
 )
 from kcee_ui.cache import mmap_array, cached_npy, cache_dir, cache_size_mb, clear_cache, _mtime, load_attr_row
+from kcee_ui.alignment import csv_to_npz_for_slot, assert_slot_aligned, assert_pair_aligned, AlignmentError
 
 
 st.set_page_config(page_title="k-CEE attribution browser", layout="wide")
@@ -229,21 +230,10 @@ loaded = [s for s in slots if s.get("path")]
 #   per-CT filtering (e.g. K562_log2FC.notna()).
 
 def _build_attr_csv_to_npz(slot, library_df: pd.DataFrame) -> np.ndarray:
-    n_attr = slot["n_attr"]
-    n_csv = len(library_df)
-    out = np.full(n_csv, -1, dtype=np.int64)
-    if n_attr == 0:
-        return out
-    if n_attr == n_csv:
-        out[:] = np.arange(n_csv)
-        return out
-    seq_valid = library_df["sequence"].notna().values
-    if int(seq_valid.sum()) == n_attr:
-        out[np.nonzero(seq_valid)[0]] = np.arange(n_attr)
-        return out
-    m = min(n_attr, n_csv)
-    out[:m] = np.arange(m)
-    return out
+    """Delegate to kcee_ui.alignment so unknown drop policies raise instead of
+    silently aliasing rows. Old behavior aliased LegNet (n=56975) onto rows
+    [0..56974] of the CSV, misaligning row 18321 onwards."""
+    return csv_to_npz_for_slot(slot, library_df, strict=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -279,7 +269,12 @@ if loaded and csv_path and Path(csv_path).exists():
 
 if loaded and library is not None:
     for s in loaded:
-        s["attr_csv_to_npz"] = _build_attr_csv_to_npz(s, library)
+        try:
+            s["attr_csv_to_npz"] = _build_attr_csv_to_npz(s, library)
+            assert_slot_aligned(s, library, s["attr_csv_to_npz"])
+        except AlignmentError as e:
+            st.sidebar.error(f"alignment failure: {e}")
+            s["attr_csv_to_npz"] = np.full(len(library), -1, dtype=np.int64)
         s["covered_csv"] = np.nonzero(s["attr_csv_to_npz"] >= 0)[0]
 
 
@@ -368,6 +363,7 @@ def _cossim_full(path_a: str, key_a: str, path_b: str, key_b: str,
             int(ins_off_a), int(ins_off_b), "v2")
 
     def _go():
+        assert_pair_aligned(("a", _a_map), ("b", _b_map))
         imp_a = _cached_importance(path_a, key_a, csv_path, a_map_hash, int(ins_off_a), _a_map)
         imp_b = _cached_importance(path_b, key_b, csv_path, b_map_hash, int(ins_off_b), _b_map)
         a_lo, a_hi = _var_window(int(ins_off_a), int(imp_a.shape[1]))
@@ -396,6 +392,7 @@ def _eigenmaps_full(path_a: str, key_a: str, path_b: str, key_b: str,
             int(ins_off_a), int(ins_off_b), "v2")
 
     def _go():
+        assert_pair_aligned(("a", _a_map), ("b", _b_map))
         imp_a = _cached_importance(path_a, key_a, csv_path, a_map_hash, int(ins_off_a), _a_map)
         imp_b = _cached_importance(path_b, key_b, csv_path, b_map_hash, int(ins_off_b), _b_map)
         a_lo, a_hi = _var_window(int(ins_off_a), int(imp_a.shape[1]))
@@ -423,6 +420,7 @@ def _dev_full(paths: tuple[tuple[str, str], ...], csv_path: str,
                        + (csv_path, len(_maps), "v3")
 
     def _go():
+        assert_pair_aligned(*[(f"slot{i}", m) for i, m in enumerate(_maps)])
         imps_full: list[np.ndarray] = []
         for (p, k), mh, off, m in zip(paths, map_hashes, insert_offsets, _maps):
             imp = _cached_importance(p, k, csv_path, mh, int(off), m)

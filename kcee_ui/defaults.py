@@ -28,6 +28,10 @@ _LEGNET_K562  = f"{_LEGNET_DIR}/attrs_K562.h5"
 # Standardized AlphaGenome encoder ckpts used to produce
 # deeplift_attributions_standardtorch.{npz,h5}. The model labels match the
 # directory names under /grid/koo/home/shared/models/alphagenome_encoder/torch.
+#
+# `insert_offset`: position in the 230bp library insert that corresponds to
+# attr position 0. Koo lab attrs are saved var-only ((N,4,200) = insert[15:215])
+# so insert_offset=15. See .ui-guy/wt_alignment.md.
 DEFAULT_SLOTS: list[dict] = [
     {
         "cell_type": "HepG2",
@@ -37,6 +41,7 @@ DEFAULT_SLOTS: list[dict] = [
         "log2fc_col": "HepG2_log2FC",
         "path": DEFAULT_ATTR_FILE,
         "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/HepG2/hits.tsv",
+        "insert_offset": 15,
     },
     {
         "cell_type": "K562",
@@ -46,6 +51,7 @@ DEFAULT_SLOTS: list[dict] = [
         "log2fc_col": "K562_log2FC",
         "path": DEFAULT_ATTR_FILE,
         "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/K562/hits.tsv",
+        "insert_offset": 15,
     },
     {
         "cell_type": "WTC11",
@@ -55,11 +61,13 @@ DEFAULT_SLOTS: list[dict] = [
         "log2fc_col": "WTC11_log2FC",
         "path": DEFAULT_ATTR_FILE,
         "finemo_tsv": "",
+        "insert_offset": 15,
     },
 ]
 
 # MPRA-LegNet attribution maps: per-cell-line h5, no WTC11.
-# Each h5 has datasets `attributions` (N, 4, 230) and `predictions` (N,).
+# Each h5 has datasets `attributions` (N, 4, 200) and `predictions` (N,).
+# Var-only saved (insert[15:215]); insert_offset=15.
 LEGNET_SLOTS: list[dict] = [
     {
         "cell_type": "HepG2",
@@ -69,6 +77,7 @@ LEGNET_SLOTS: list[dict] = [
         "log2fc_col": "HepG2_log2FC",
         "path": _LEGNET_HEPG2,
         "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/HepG2/hits.tsv",
+        "insert_offset": 15,
     },
     {
         "cell_type": "K562",
@@ -78,11 +87,14 @@ LEGNET_SLOTS: list[dict] = [
         "log2fc_col": "K562_log2FC",
         "path": _LEGNET_K562,
         "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/K562/hits.tsv",
+        "insert_offset": 15,
     },
 ]
 
 # Older AlphaGenome attributions (eigen-interactions pipeline, v6_do0X ckpts).
 # Kept selectable for cross-model comparison; UI label is "Pablo models".
+# Saved over the full 281bp construct (insert(230)+prom(36)+bar(15)); insert
+# starts at construct position 0, so insert_offset=0.
 PABLO_SLOTS: list[dict] = [
     {
         "cell_type": "HepG2",
@@ -92,6 +104,7 @@ PABLO_SLOTS: list[dict] = [
         "log2fc_col": "HepG2_log2FC",
         "path": PABLO_ATTR_FILE,
         "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/HepG2/hits.tsv",
+        "insert_offset": 0,
     },
     {
         "cell_type": "K562",
@@ -101,6 +114,7 @@ PABLO_SLOTS: list[dict] = [
         "log2fc_col": "K562_log2FC",
         "path": PABLO_ATTR_FILE,
         "finemo_tsv": f"{_REPO}/genomic_targets/data/motif/K562/hits.tsv",
+        "insert_offset": 0,
     },
     {
         "cell_type": "WTC11",
@@ -110,6 +124,7 @@ PABLO_SLOTS: list[dict] = [
         "log2fc_col": "WTC11_log2FC",
         "path": PABLO_ATTR_FILE,
         "finemo_tsv": "",
+        "insert_offset": 0,
     },
 ]
 
@@ -118,6 +133,22 @@ DATA_SOURCES: dict[str, list[dict]] = {
     "Pablo models": PABLO_SLOTS,
     "MPRA-LegNet": LEGNET_SLOTS,
 }
+
+
+def infer_insert_offset(attr_L: int) -> int:
+    """Map a saved attribution length back to where attr position 0 sits in the
+    230bp library insert. Lets the UI Do The Right Thing when an attribution
+    file is regenerated with a different layout (e.g. Pablo models switching
+    from 281bp full construct to 200bp var-only via attr_shards_uniform/).
+
+    200 -> 15  (var-only, attr starts at insert[15])
+    230 -> 0   (bare insert)
+    281 -> 0   (insert + prom(36) + bar(15); insert is at construct[0:230])
+    other -> 0 (with the explicit slot value overriding via slot.get('insert_offset'))
+    """
+    if attr_L == 200:
+        return 15
+    return 0
 
 
 def slots_for_cell_type(ct: str) -> list[dict]:

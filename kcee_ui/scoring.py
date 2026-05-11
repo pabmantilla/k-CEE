@@ -70,21 +70,27 @@ def eigenmaps_score(imp_a: np.ndarray, imp_b: np.ndarray,
     return (var_ratio * c01).astype(np.float32)
 
 
-def deviation_from_shared(attr_list: list[np.ndarray]) -> np.ndarray:
+def deviation_from_shared(imp_list: list[np.ndarray]) -> np.ndarray:
     """Per-sequence deviation from the equiangular ray across cell types.
 
-    For each (4, L) element across `n_ct` attribution stacks, decompose the
-    `n_ct`-vector v into a parallel component (along (1,1,...,1)/sqrt(n_ct))
-    and perpendicular component. Returns the per-sequence fraction of
-    squared L2 energy that is perpendicular.
+    Operates on WT×attr importance maps for parity with cossim/eigenmaps:
+    each input is an (N, L) per-position importance array. For each position,
+    decompose the n_ct-vector into a parallel component along
+    (1,1,...,1)/sqrt(n_ct) and a perpendicular component. Returns the
+    per-sequence fraction of squared L2 energy that is perpendicular.
 
     Result range: [0, 1]. 0 = perfectly shared, 1 = orthogonal to shared.
     Works with any n_ct >= 2.
     """
-    if len(attr_list) < 2:
-        raise ValueError("Need at least 2 attribution stacks.")
-    n = min(a.shape[0] for a in attr_list)
-    stacks = np.stack([a[:n].reshape(n, -1) for a in attr_list], axis=1)  # (n, n_ct, F)
+    if len(imp_list) < 2:
+        raise ValueError("Need at least 2 importance stacks.")
+    for a in imp_list:
+        if a.ndim != 2:
+            raise ValueError(
+                f"deviation_from_shared expects (N, L) importance, got shape {a.shape}"
+            )
+    n = min(a.shape[0] for a in imp_list)
+    stacks = np.stack([a[:n] for a in imp_list], axis=1)  # (n, n_ct, L)
     n_ct = stacks.shape[1]
     parallel_sq = (stacks.sum(axis=1) ** 2) / n_ct
     total_sq = (stacks ** 2).sum(axis=1)

@@ -1,0 +1,5 @@
+- [Attribution windows](attribution_windows.md) — per-source DeepLIFT input length + saved-attr coords across the 3 viewer data sources
+- [WT alignment per source](wt_alignment.md) — `insert_offset` per slot + auto-detection from attr_L; how the off-by-15 bug happened and how to avoid it
+- [NaN rows in standardtorch file](nan_rows.md) — rows 18321/18322 are NaN; UI guards plots and zero-fills for scoring
+- [Alignment guard](alignment_guard.md) — `kcee_ui/alignment.py` replaces the silent first-m fallback; flags drop-policy mismatches at slot load and per cossim/EigenMap/dev call
+- [Version log](VERSION.md) — version + changelog

@@ -221,23 +221,32 @@ def plot_attribution(
     fast_logo(a.T, ax=ax)
 
     if hits:
-        ymin = float(np.minimum(a.min(), 0.0))
-        ymax = float(np.maximum(a.max(), 0.0))
+        # Use stack heights, not raw per-channel min/max — fast_logo stacks
+        # positives upward and negatives downward, so the visible y-extent
+        # is (Σ negatives, Σ positives) per position. Using a.min/max here
+        # makes letters overflow the axis on multi-channel positions.
+        _pos_sum = np.maximum(a, 0.0).sum(axis=0)
+        _neg_sum = np.minimum(a, 0.0).sum(axis=0)
+        ymin = float(min(0.0, _neg_sum.min())) if _neg_sum.size else 0.0
+        ymax = float(max(0.0, _pos_sum.max())) if _pos_sum.size else 0.0
         span = max(ymax - ymin, 1e-6)
-        underline_y = ymin - 0.10 * span
-        ax.set_ylim(ymin - 0.20 * span, ymax + 0.05 * span)
+        # Underline flush with the lowest letter (y == ymin) and the label
+        # tucked just below it, so the marks read as "this stretch of seq".
+        underline_y = ymin
+        ax.set_ylim(ymin - 0.09 * span, ymax + 0.03 * span)
         for h in hits:
             s = max(0, int(h["start"]))
             e = min(L, int(h["end"]))
             if e <= s:
                 continue
-            ax.plot([s, e - 1], [underline_y, underline_y], lw=2.5, color="#222", solid_capstyle="butt")
+            ax.plot([s, e - 1], [underline_y, underline_y],
+                    lw=3.0, color="#222", solid_capstyle="butt")
             label = h.get("motif", "")
             if label.startswith("pos_patterns.pattern_"):
                 label = "p" + label.split("pattern_")[-1]
             elif label.startswith("neg_patterns.pattern_"):
                 label = "n" + label.split("pattern_")[-1]
-            ax.text((s + e - 1) / 2, underline_y - 0.03 * span, label,
+            ax.text((s + e - 1) / 2, underline_y - 0.015 * span, label,
                     ha="center", va="top", fontsize=7, color="#444")
 
     ax.set_title(title, fontsize=10, color="#111")

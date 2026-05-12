@@ -7,6 +7,7 @@ finemo underlines.
 Run:
     uv run streamlit run app.py
 """
+import colorsys
 import hashlib
 import re
 from functools import reduce
@@ -449,28 +450,28 @@ if library is not None:
         and library[c].nunique(dropna=True) <= 200
     ]
     if _eligible_annot_cols:
-        _pc.markdown("**library category**")
-        annot_col = _pc.selectbox(
-            "column", ["(none)"] + _eligible_annot_cols, index=0,
-            key=f"annot_col__{_slot_key_tag}",
-            help="Library CSV column for filter/color (e.g. 'category').",
-        )
-        if annot_col == "(none)":
-            annot_col = None
-        if annot_col is not None:
-            annot_values = sorted(library[annot_col].dropna().astype(str).unique().tolist())
-            _picked = _pc.multiselect(
-                f"filter {annot_col} (empty = all)",
-                annot_values, default=[],
-                key=f"annot_vals__{annot_col}",
+        with _pc.expander("library category", expanded=False):
+            annot_col = st.selectbox(
+                "column", ["(none)"] + _eligible_annot_cols, index=0,
+                key=f"annot_col__{_slot_key_tag}",
+                help="Library CSV column for filter/color (e.g. 'category').",
             )
-            _vi = {v: i for i, v in enumerate(annot_values)}
-            annot_codes = (
-                library[annot_col].astype("string").map(_vi).fillna(-1).astype("int32").to_numpy()
-            )
-            if _picked:
-                _picked_codes = np.array([_vi[v] for v in _picked if v in _vi], dtype=np.int32)
-                annot_filter_mask = np.isin(annot_codes, _picked_codes)
+            if annot_col == "(none)":
+                annot_col = None
+            if annot_col is not None:
+                annot_values = sorted(library[annot_col].dropna().astype(str).unique().tolist())
+                _picked = st.multiselect(
+                    f"filter {annot_col} (empty = all)",
+                    annot_values, default=[],
+                    key=f"annot_vals__{annot_col}",
+                )
+                _vi = {v: i for i, v in enumerate(annot_values)}
+                annot_codes = (
+                    library[annot_col].astype("string").map(_vi).fillna(-1).astype("int32").to_numpy()
+                )
+                if _picked:
+                    _picked_codes = np.array([_vi[v] for v in _picked if v in _vi], dtype=np.int32)
+                    annot_filter_mask = np.isin(annot_codes, _picked_codes)
 
 
 # --- score over common CSV rows ---
@@ -878,6 +879,10 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
                  dragmode: str, boxes_hash: str,
                  dot_size: int,
                  discrete: bool,
+                 show_colorbar: bool,
+                 marg_norm: str,
+                 hex_to_label: tuple[tuple[str, str], ...],
+                 highlight_hex: str,
                  _x: np.ndarray, _y: np.ndarray, _custom: np.ndarray,
                  _color: np.ndarray, _marg_color: np.ndarray,
                  _boxes: list | None = None) -> go.Figure:
@@ -893,65 +898,246 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
         fig = go.Figure()
         scatter_row = scatter_col = None
 
+    _hover_d = "csv_row=%{customdata}<br>x=%{x:.3f}<br>mech=%{y:.3f}<extra></extra>"
+    _hover_c = (
+        "csv_row=%{customdata}<br>x=%{x:.3f}"
+        "<br>mech=%{y:.3f}<br>color=%{marker.color:.3f}<extra></extra>"
+    )
+
+    # Discrete coloring: split into one trace per category, ordered by count
+    # DESC (largest added first → smallest rendered ON TOP). When a highlight
+    # is active we force the highlighted hex to render LAST and boost its
+    # opacity + size so it pops out of the sea of grey.
+    _disc_uniq = _disc_inv = _disc_order = None
+    if discrete and _color.size:
+        _disc_uniq, _disc_inv, _disc_cnt = np.unique(
+            _color, return_inverse=True, return_counts=True,
+        )
+        _disc_order = np.argsort(_disc_cnt)[::-1]
+        if highlight_hex:
+            _hl_idx = np.where(_disc_uniq == highlight_hex)[0]
+            if _hl_idx.size:
+                _hl_i = int(_hl_idx[0])
+                _disc_order = np.concatenate([
+                    _disc_order[_disc_order != _hl_i],
+                    np.array([_hl_i]),
+                ])
+
     if discrete:
-        marker = dict(size=dot_size, color=_color, opacity=0.7)
-        _hover = "csv_row=%{customdata}<br>x=%{x:.3f}<br>mech=%{y:.3f}<extra></extra>"
+        for ci in (_disc_order if _disc_order is not None else []):
+            mask = (_disc_inv == ci)
+            _hex = str(_disc_uniq[ci])
+            if highlight_hex:
+                if _hex == highlight_hex:
+                    _op, _sz = 1.0, int(dot_size) + 2
+                else:
+                    _op, _sz = 0.25, int(dot_size)
+            else:
+                _op, _sz = 0.7, int(dot_size)
+            trace = go.Scattergl(
+                x=_x[mask], y=_y[mask], mode="markers",
+                marker=dict(size=_sz, color=_hex, opacity=_op),
+                customdata=_custom[mask],
+                hovertemplate=_hover_d,
+                selected=dict(marker=dict(opacity=_op)),
+                unselected=dict(marker=dict(opacity=_op)),
+                showlegend=False, name=_hex,
+            )
+            if has_marg:
+                fig.add_trace(trace, row=scatter_row, col=scatter_col)
+            else:
+                fig.add_trace(trace)
     else:
         marker = dict(
-            size=dot_size,
-            color=_color,
-            colorscale=colorscale,
-            opacity=0.7,
-            colorbar=dict(title=dict(text=color_label, side="right")),
+            size=dot_size, color=_color, colorscale=colorscale, opacity=0.7,
         )
+        if show_colorbar:
+            marker["colorbar"] = dict(title=dict(text=color_label, side="right"))
+        else:
+            marker["showscale"] = False
         if vmin is not None:
             marker["cmin"] = float(vmin)
         if vmax is not None:
             marker["cmax"] = float(vmax)
-        _hover = (
-            "csv_row=%{customdata}<br>x=%{x:.3f}"
-            "<br>mech=%{y:.3f}<br>color=%{marker.color:.3f}<extra></extra>"
+        scatter = go.Scattergl(
+            x=_x, y=_y, mode="markers", marker=marker,
+            customdata=_custom, hovertemplate=_hover_c,
+            selected=dict(marker=dict(opacity=0.7)),
+            unselected=dict(marker=dict(opacity=0.7)),
+            name="",
         )
+        if has_marg:
+            fig.add_trace(scatter, row=scatter_row, col=scatter_col)
+        else:
+            fig.add_trace(scatter)
 
-    scatter = go.Scattergl(
-        x=_x,
-        y=_y,
-        mode="markers",
-        marker=marker,
-        customdata=_custom,
-        hovertemplate=_hover,
-        selected=dict(marker=dict(opacity=0.7)),
-        unselected=dict(marker=dict(opacity=0.7)),
-        name="",
-    )
+    def _shared_grid(arr, n=200):
+        finite = np.isfinite(arr)
+        if not finite.any():
+            return None
+        v = arr[finite]
+        lo, hi = float(v.min()), float(v.max())
+        if lo == hi:
+            hi = lo + 1.0
+        pad = 0.05 * (hi - lo)
+        return np.linspace(lo - pad, hi + pad, n), int(finite.sum()), float(v.std() or 1.0)
+
+    def _kde_1d(samples, grid, bw):
+        # vectorized gaussian KDE; area under curve == 1
+        if samples.size == 0 or bw <= 0:
+            return np.zeros_like(grid)
+        z = (grid[:, None] - samples[None, :]) / bw
+        return np.exp(-0.5 * z * z).sum(axis=1) / (samples.size * bw * np.sqrt(2 * np.pi))
+
+    def _add_discrete_marg(arr, axis_kind, mode, row, col):
+        # Smoothed KDE per category (shared bandwidth via Silverman on pooled
+        # std). Three norms:
+        #   global       : each cat scaled by its share of total -> stacks to
+        #                  the overall KDE (mode=density) or raw counts/widths
+        #                  (mode=counts).
+        #   per-category : every curve is a PDF (area=1), overlay so peaks are
+        #                  directly comparable regardless of category size.
+        #   per-bin      : at each grid x, N_cat * KDE_cat / Σ_k N_k * KDE_k —
+        #                  stacked to 1 everywhere; reads as "share of locals".
+        out = _shared_grid(arr, n=200)
+        if out is None:
+            return
+        grid, total_global, pooled_std = out
+        # Silverman's rule on the pooled sample; shared across categories so
+        # curves are comparable.
+        bw = 1.06 * pooled_std * max(total_global, 1) ** (-1 / 5)
+        bw = max(bw, 1e-6)
+
+        kdes = []  # (ci, n_cat, kde_cat)
+        for ci in _disc_order:
+            mask = (_disc_inv == ci) & np.isfinite(arr)
+            sub = arr[mask].astype(np.float64, copy=False)
+            if sub.size == 0:
+                continue
+            kdes.append((ci, sub.size, _kde_1d(sub, grid, bw)))
+        if not kdes:
+            return
+
+        if marg_norm == "per-bin":
+            denom = sum(n * k for _, n, k in kdes)
+            denom = np.where(denom > 0, denom, 1.0)
+            curves = [(ci, (n * k) / denom) for ci, n, k in kdes]
+            stacked = True
+        elif marg_norm == "per-category":
+            # each curve = PDF; let mode scale uniformly (density default)
+            if mode == "counts":
+                curves = [(ci, n * k) for ci, n, k in kdes]
+            else:
+                curves = [(ci, k) for ci, n, k in kdes]
+            stacked = False
+        else:  # "global"
+            if mode == "counts":
+                curves = [(ci, n * k) for ci, n, k in kdes]
+            elif mode == "probability":
+                curves = [(ci, (n / max(total_global, 1)) * k * (grid[1] - grid[0]))
+                          for ci, n, k in kdes]
+            else:  # density
+                curves = [(ci, (n / max(total_global, 1)) * k) for ci, n, k in kdes]
+            stacked = True
+
+        # Hover/click reveal: map hex -> label so each KDE trace tells the
+        # user which motif (or combo) it represents. Click on a curve in
+        # plotly's UI selects it (same identity surfaces in the tooltip).
+        _h2l = dict(hex_to_label) if hex_to_label else {}
+
+        def _label_for(hex_str: str) -> str:
+            return _h2l.get(hex_str, hex_str)
+
+        # Plot order: largest -> smallest, so stacked draws big at the bottom
+        # and overlay draws small on top.
+        if stacked:
+            cum = np.zeros_like(grid)
+            for ci, vals in curves:
+                lo = cum.copy()
+                hi = cum + vals
+                _color_hex = str(_disc_uniq[ci])
+                _label = _label_for(_color_hex)
+                _hover = "<b>%{fullData.name}</b><br>%{x:.3f}, %{y:.4f}<extra></extra>"
+                if axis_kind == "x":
+                    fig.add_trace(go.Scatter(
+                        x=grid, y=lo, mode="lines",
+                        line=dict(width=0, color="rgba(0,0,0,0)"),
+                        showlegend=False, hoverinfo="skip", name="",
+                    ), row=row, col=col)
+                    fig.add_trace(go.Scatter(
+                        x=grid, y=hi, mode="lines",
+                        line=dict(width=0.6, color=_color_hex),
+                        fill="tonexty", fillcolor=_color_hex, opacity=0.8,
+                        showlegend=False, name=_label,
+                        hovertemplate=_hover,
+                    ), row=row, col=col)
+                else:
+                    fig.add_trace(go.Scatter(
+                        x=lo, y=grid, mode="lines",
+                        line=dict(width=0, color="rgba(0,0,0,0)"),
+                        showlegend=False, hoverinfo="skip", name="",
+                    ), row=row, col=col)
+                    fig.add_trace(go.Scatter(
+                        x=hi, y=grid, mode="lines",
+                        line=dict(width=0.6, color=_color_hex),
+                        fill="tonextx", fillcolor=_color_hex, opacity=0.8,
+                        showlegend=False, name=_label,
+                        hovertemplate=_hover,
+                    ), row=row, col=col)
+                cum = hi
+        else:
+            for ci, vals in curves:
+                _color_hex = str(_disc_uniq[ci])
+                _label = _label_for(_color_hex)
+                _hover = "<b>%{fullData.name}</b><br>%{x:.3f}, %{y:.4f}<extra></extra>"
+                if axis_kind == "x":
+                    fig.add_trace(go.Scatter(
+                        x=grid, y=vals, mode="lines",
+                        line=dict(width=1.6, color=_color_hex),
+                        showlegend=False, name=_label,
+                        hovertemplate=_hover,
+                    ), row=row, col=col)
+                else:
+                    fig.add_trace(go.Scatter(
+                        x=vals, y=grid, mode="lines",
+                        line=dict(width=1.6, color=_color_hex),
+                        showlegend=False, name=_label,
+                        hovertemplate=_hover,
+                    ), row=row, col=col)
 
     if has_marg:
-        fig.add_trace(scatter, row=scatter_row, col=scatter_col)
+        # Marginals reflect only points inside the current x/y window so that
+        # zooming the plot tightens the KDE bandwidth and surfaces nuance.
+        # The scatter itself still draws all rows (plotly clips visually).
+        _marg_mask = np.ones(_x.shape[0], dtype=bool)
+        if xmin is not None and xmax is not None:
+            _marg_mask &= (_x >= float(xmin)) & (_x <= float(xmax))
+        if ymin is not None and ymax is not None:
+            _marg_mask &= (_y >= float(ymin)) & (_y <= float(ymax))
+        _mx = _x[_marg_mask]
+        _my = _y[_marg_mask]
+        _mmc = _marg_color[_marg_mask] if _marg_color.size else _marg_color
+        _m_disc_inv = _disc_inv[_marg_mask] if (discrete and _disc_inv is not None) else None
+
+        def _add_discrete_marg_filtered(arr, axis_kind, mode, row, col):
+            # Wrapper that calls the closure but with the filtered _disc_inv
+            # shadowed in. We rebind _disc_inv via a local closure trick: pass
+            # a fresh mask-applied view to the existing function logic.
+            nonlocal _disc_inv
+            _saved = _disc_inv
+            _disc_inv = _m_disc_inv
+            try:
+                _add_discrete_marg(arr, axis_kind, mode, row, col)
+            finally:
+                _disc_inv = _saved
+
         if marg_x != "none":
-            out = None if discrete else _binned_mean(_x, _marg_color, bins=30)
-            if out is not None:
-                centers, widths, counts, means = out
-                hn = marg_x
-                total = counts.sum() or 1.0
-                if hn == "density":
-                    yvals = counts / (total * widths)
-                elif hn == "probability":
-                    yvals = counts / total
-                else:
-                    yvals = counts
-                fig.add_trace(
-                    go.Bar(
-                        x=centers, y=yvals, width=widths,
-                        marker=dict(color=means, colorscale=colorscale,
-                                    cmin=vmin, cmax=vmax, showscale=False),
-                        showlegend=False, name="",
-                    ),
-                    row=1, col=1,
-                )
+            if discrete and _disc_order is not None:
+                _add_discrete_marg_filtered(_mx, "x", marg_x, row=1, col=1)
             else:
-                out2 = _binned_counts(_x, bins=30)
-                if out2 is not None:
-                    centers, widths, counts = out2
+                out = None if discrete else _binned_mean(_mx, _mmc, bins=30)
+                if out is not None:
+                    centers, widths, counts, means = out
                     hn = marg_x
                     total = counts.sum() or 1.0
                     if hn == "density":
@@ -963,36 +1149,39 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
                     fig.add_trace(
                         go.Bar(
                             x=centers, y=yvals, width=widths,
-                            marker_color="#888",
+                            marker=dict(color=means, colorscale=colorscale,
+                                        cmin=vmin, cmax=vmax, showscale=False),
                             showlegend=False, name="",
                         ),
                         row=1, col=1,
                     )
-        if marg_y != "none":
-            out = None if discrete else _binned_mean(_y, _marg_color, bins=30)
-            if out is not None:
-                centers, widths, counts, means = out
-                hn = marg_y
-                total = counts.sum() or 1.0
-                if hn == "density":
-                    xvals = counts / (total * widths)
-                elif hn == "probability":
-                    xvals = counts / total
                 else:
-                    xvals = counts
-                fig.add_trace(
-                    go.Bar(
-                        x=xvals, y=centers, width=widths, orientation='h',
-                        marker=dict(color=means, colorscale=colorscale,
-                                    cmin=vmin, cmax=vmax, showscale=False),
-                        showlegend=False, name="",
-                    ),
-                    row=2, col=2,
-                )
+                    out2 = _binned_counts(_mx, bins=30)
+                    if out2 is not None:
+                        centers, widths, counts = out2
+                        hn = marg_x
+                        total = counts.sum() or 1.0
+                        if hn == "density":
+                            yvals = counts / (total * widths)
+                        elif hn == "probability":
+                            yvals = counts / total
+                        else:
+                            yvals = counts
+                        fig.add_trace(
+                            go.Bar(
+                                x=centers, y=yvals, width=widths,
+                                marker_color="#888",
+                                showlegend=False, name="",
+                            ),
+                            row=1, col=1,
+                        )
+        if marg_y != "none":
+            if discrete and _disc_order is not None:
+                _add_discrete_marg_filtered(_my, "y", marg_y, row=2, col=2)
             else:
-                out2 = _binned_counts(_y, bins=30)
-                if out2 is not None:
-                    centers, widths, counts = out2
+                out = None if discrete else _binned_mean(_my, _mmc, bins=30)
+                if out is not None:
+                    centers, widths, counts, means = out
                     hn = marg_y
                     total = counts.sum() or 1.0
                     if hn == "density":
@@ -1004,15 +1193,35 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
                     fig.add_trace(
                         go.Bar(
                             x=xvals, y=centers, width=widths, orientation='h',
-                            marker_color="#888",
+                            marker=dict(color=means, colorscale=colorscale,
+                                        cmin=vmin, cmax=vmax, showscale=False),
                             showlegend=False, name="",
                         ),
                         row=2, col=2,
                     )
+                else:
+                    out2 = _binned_counts(_my, bins=30)
+                    if out2 is not None:
+                        centers, widths, counts = out2
+                        hn = marg_y
+                        total = counts.sum() or 1.0
+                        if hn == "density":
+                            xvals = counts / (total * widths)
+                        elif hn == "probability":
+                            xvals = counts / total
+                        else:
+                            xvals = counts
+                        fig.add_trace(
+                            go.Bar(
+                                x=xvals, y=centers, width=widths, orientation='h',
+                                marker_color="#888",
+                                showlegend=False, name="",
+                            ),
+                            row=2, col=2,
+                        )
         fig.update_xaxes(title_text=xaxis_label, row=2, col=1)
         fig.update_yaxes(title_text=f"{score_label}   [mech]", row=2, col=1)
     else:
-        fig.add_trace(scatter)
         fig.update_layout(
             xaxis_title=xaxis_label,
             yaxis_title=f"{score_label}   [mech]",
@@ -1024,6 +1233,7 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
         margin=dict(l=40, r=20, t=30, b=40),
         template="plotly_white",
         dragmode=dragmode,
+        barmode=("stack" if discrete else "group"),
     )
     if xmin is not None and xmax is not None:
         if has_marg:
@@ -1106,7 +1316,6 @@ def _measured_for(ct):
 with _pc:
     # Colorscale follows the per-score-type default (RdBu_r / Inferno / Magma).
     plot_colorscale = score_cmap
-    plot_dot_size = int(st.slider("dot size", 1, 12, 4, 1, key="pc_dot_size"))
     # Build the x/y axis chooser pool. Each option maps to an array aligned to common_csv.
     _axis_pool: dict[str, np.ndarray | None] = {"auto": None}
     for s in (loaded[i] for i in ABC):
@@ -1131,8 +1340,9 @@ with _pc:
         if _pa is not None and _pb is not None:
             _axis_pool["pred(A) − pred(B)"] = (_pa - _pb).astype(np.float32)
     _axis_opts = list(_axis_pool.keys())
-    x_axis_choice = st.selectbox("x-axis", _axis_opts, index=0, key="pc_xaxis")
-    y_axis_choice = st.selectbox("y-axis", _axis_opts, index=0, key="pc_yaxis")
+    with st.expander("axes", expanded=False):
+        x_axis_choice = st.selectbox("x-axis", _axis_opts, index=0, key="pc_xaxis")
+        y_axis_choice = st.selectbox("y-axis", _axis_opts, index=0, key="pc_yaxis")
 
     # Unified color pool: continuous entries reuse axis arrays; residual entries
     # are pred-minus-measured; library categorical columns produce discrete entries.
@@ -1175,6 +1385,21 @@ with _pc:
     _PALETTE = ["#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00",
                 "#CC79A7", "#999999", "#882255", "#117733", "#88CCEE", "#AA4499"]
     _NA_HEX = "#BDBDBD"
+
+    def _extended_palette(n: int) -> list[str]:
+        if n <= 0:
+            return []
+        out = list(_PALETTE[:min(n, len(_PALETTE))])
+        if n > len(_PALETTE):
+            extra = n - len(_PALETTE)
+            step = 360.0 / extra
+            for i in range(extra):
+                hue = (15.0 + i * step) % 360.0
+                r, g, b = colorsys.hls_to_rgb(hue / 360.0, 0.55, 0.65)
+                out.append("#{:02X}{:02X}{:02X}".format(
+                    int(round(r * 255)), int(round(g * 255)), int(round(b * 255))))
+        return out
+
     if library is not None:
         for _col in library.columns:
             if _col in ("sequence", "csv_row", "name"):
@@ -1192,62 +1417,869 @@ with _pc:
                 [_palette_map.get(str(v), _NA_HEX) for v in _per_row_cat], dtype="<U7"
             )
             _color_pool[f"library: {_col}"] = ("discrete", _per_row_hex, _palette_map)
+    # Single unified finemo entry — aggregates hits from every loaded slot
+    # whose finemo_tsv is set. Motifs are namespaced by source cell type so
+    # patterns from different modisco runs stay distinct in syntax combos.
+    _fm_slot_list = []
+    _seen_fm_paths: set[str] = set()
+    for _s in loaded:
+        _fm_path = _s.get("finemo_tsv", "")
+        if not _fm_path or _fm_path in _seen_fm_paths:
+            continue
+        _seen_fm_paths.add(_fm_path)
+        _fm_slot_list.append(_s)
+    if _fm_slot_list:
+        _color_pool["finemo"] = ("finemo", _fm_slot_list)
 
-    _color_opts = ["auto (mean activity)"] + list(_color_pool.keys())
-    color_mode = st.selectbox("color by", _color_opts, index=0, key="pc_color")
+    with st.expander("color", expanded=False):
+        _color_opts = ["auto (mean activity)"] + list(_color_pool.keys())
+        color_mode = st.selectbox("color by", _color_opts, index=0, key="pc_color")
 
-    _color_arr = None
-    _color_is_discrete = False
-    _color_legend: list[tuple[str, str]] = []
-    color_label = "—"
-    if color_mode == "auto (mean activity)":
-        if "average magnitude" in _color_pool:
-            _color_arr = _color_pool["average magnitude"][1]
-            color_label = "mean activity"
+        _color_arr = None
+        _color_is_discrete = False
+        _color_legend: list[tuple[str, str]] = []
+        _color_grad_fig = None
+        _bin_export_name: str | None = None
+        _bin_export_per_row_label: np.ndarray | None = None
+        _continuous_metric_arr: np.ndarray | None = None
+        _excluded_rows_mask: np.ndarray | None = None
+        color_label = "—"
+        if color_mode == "auto (mean activity)":
+            if "average magnitude" in _color_pool:
+                _color_arr = _color_pool["average magnitude"][1]
+                _continuous_metric_arr = np.asarray(_color_arr, dtype=np.float32)
+                color_label = "mean activity"
+            else:
+                _color_arr = np.full(common_csv.shape[0], np.nan, dtype=np.float32)
+                color_label = "mean activity (n/a)"
         else:
-            _color_arr = np.full(common_csv.shape[0], np.nan, dtype=np.float32)
-            color_label = "mean activity (n/a)"
-    else:
-        _entry = _color_pool.get(color_mode)
-        if _entry is not None and _entry[0] == "continuous":
-            _color_arr = np.asarray(_entry[1], dtype=np.float32)
-            color_label = color_mode
-        elif _entry is not None and _entry[0] == "discrete":
-            _color_arr = _entry[1]
-            _color_is_discrete = True
-            color_label = color_mode
-            _color_legend = [(k, v) for k, v in _entry[2].items()]
-    if _color_is_discrete and _color_legend:
-        _rows = []
-        for _cat, _hex in _color_legend[:12]:
-            _txt = str(_cat)
-            if len(_txt) > 28:
-                _txt = _txt[:27] + "…"
-            _rows.append(
-                f"<span style='display:inline-block;width:10px;height:10px;"
-                f"background:{_hex};border-radius:2px;margin-right:4px;'></span>{_txt}"
+            _entry = _color_pool.get(color_mode)
+            if _entry is not None and _entry[0] == "continuous":
+                _color_arr = np.asarray(_entry[1], dtype=np.float32)
+                _continuous_metric_arr = _color_arr
+                color_label = color_mode
+            elif _entry is not None and _entry[0] == "discrete":
+                _color_arr = _entry[1]
+                _color_is_discrete = True
+                color_label = color_mode
+                _color_legend = [(k, v) for k, v in _entry[2].items()]
+            elif _entry is not None and _entry[0] == "finemo":
+                _fm_slots = _entry[1]  # list of slots, one per finemo source
+                _name_keys = tuple(library["name"].astype(str).tolist())
+                _name_vals = tuple(range(len(library)))
+
+                def _short_motif(m: str) -> str:
+                    if m.startswith("pos_patterns.pattern_"):
+                        return "p" + m.split("pattern_")[-1]
+                    if m.startswith("neg_patterns.pattern_"):
+                        return "n" + m.split("pattern_")[-1]
+                    return m
+
+                def _row_hits_for_slot(_slot) -> list[list[dict]]:
+                    # Per-row, the hits inside the slot's saved attribution
+                    # window (matches what the logo draws). Same _hits_to_local
+                    # plumbing — keeps scatter color and underlines aligned.
+                    _p = _slot.get("finemo_tsv", "")
+                    _fm = _cached_finemo(_p) if _p else {}
+                    _pid_map = _cached_finemo_csv_to_pid(_p, _name_keys, _name_vals) if _p else None
+                    try:
+                        _attr_L = int(_cached_attr_shape(_slot["path"], _slot["key"])[2])
+                    except Exception:
+                        _attr_L = 200
+                    _insert_off = int(_resolve_insert_offset(_slot, _attr_L))
+                    _starts = library["start_hg38"].to_numpy()
+                    _out: list[list[dict]] = []
+                    for _csv in common_csv:
+                        _pid = int(_pid_map[int(_csv)]) if _pid_map is not None else -1
+                        if _pid < 0:
+                            _out.append([])
+                            continue
+                        _raw = _fm.get(_pid, [])
+                        if not _raw:
+                            _out.append([])
+                            continue
+                        _out.append(_hits_to_local(
+                            _raw, float(_starts[int(_csv)]),
+                            _attr_L, insert_offset=_insert_off,
+                        ))
+                    return _out
+
+                # Per-ct hits (for condition-overlap mode) and a flat motif
+                # list per row with cell-type-namespaced names (e.g. 'HepG2:p3'
+                # vs 'K562:p3' — different modisco runs).
+                _hits_by_ct: dict[str, list[list[dict]]] = {}
+                for _slot in _fm_slots:
+                    _ct = str(_slot.get("cell_type") or short_name(_slot["name"]))
+                    _hits_by_ct[_ct] = _row_hits_for_slot(_slot)
+                _ct_order = list(_hits_by_ct.keys())
+                _row_motifs: list[list[str]] = []
+                for _i in range(len(common_csv)):
+                    _flat: list[str] = []
+                    for _ct in _ct_order:
+                        for _h in _hits_by_ct[_ct][_i]:
+                            _flat.append(f"{_ct}:{_short_motif(str(_h.get('motif', '')))}")
+                    _row_motifs.append(_flat)
+
+                _mode_opts = ["any hit", "syntax order", "syntax enrichment", "# motifs in seq"]
+                if len(_ct_order) >= 2:
+                    _mode_opts.append("condition overlap")
+                _mode = st.selectbox(
+                    "mode", _mode_opts, index=0, key=f"pc_finemo_mode__{color_mode}",
+                )
+
+                if _mode == "# motifs in seq":
+                    _counts = np.array([len(m) for m in _row_motifs], dtype=np.int64)
+                    _uniq = sorted(set(_counts.tolist()))
+                    _sel = st.multiselect(
+                        "show counts", _uniq, default=_uniq,
+                        key=f"pc_finemo_counts__{color_mode}",
+                        format_func=lambda v: f"{v} hit{'s' if v != 1 else ''}",
+                    )
+                    _pal = _extended_palette(len(_uniq))
+                    if len(_uniq) > 30:
+                        st.caption(":warning: many categories — colors may be hard to distinguish")
+                    _cat_to_hex = {c: _pal[i] for i, c in enumerate(_uniq)}
+                    _row_hex = np.array(
+                        [_cat_to_hex.get(int(c), _NA_HEX) for c in _counts],
+                        dtype="<U7",
+                    )
+                    _sel_set = set(int(v) for v in _sel)
+                    _excl = np.array([int(c) not in _sel_set for c in _counts])
+                    _color_arr = _row_hex
+                    _color_is_discrete = True
+                    color_label = f"{color_mode} (#hits)"
+                    _color_legend = [(f"{c} hit{'s' if c != 1 else ''}",
+                                      _cat_to_hex[c]) for c in _uniq if c in _sel_set]
+                    if _excl.any():
+                        _excluded_rows_mask = _excl
+                elif _mode == "condition overlap":
+                    # Per-row Jaccard over annotated positions between the two
+                    # cts: |A ∩ B| / |A ∪ B|. 1 = identical coverage, 0 = no
+                    # overlap (or only one condition has hits). NaN if neither
+                    # condition has any hit.
+                    _ct_a, _ct_b = _ct_order[0], _ct_order[1]
+                    _scores = np.full(len(common_csv), np.nan, dtype=np.float32)
+                    for _i in range(len(common_csv)):
+                        _ha = _hits_by_ct[_ct_a][_i]
+                        _hb = _hits_by_ct[_ct_b][_i]
+                        if not _ha and not _hb:
+                            continue
+                        _A = set()
+                        for h in _ha:
+                            _A.update(range(int(h["start"]), int(h["end"])))
+                        _B = set()
+                        for h in _hb:
+                            _B.update(range(int(h["start"]), int(h["end"])))
+                        _u = len(_A | _B)
+                        _scores[_i] = (len(_A & _B) / _u) if _u > 0 else 0.0
+                    _color_arr = _scores
+                    _continuous_metric_arr = _scores
+                    color_label = f"finemo {_ct_a}↔{_ct_b} position overlap (Jaccard)"
+                elif _mode == "syntax order":
+                    # Color by combinations of N motifs co-occurring in the
+                    # same sequence. Order=1 -> single motifs; order=2 -> all
+                    # unordered pairs; order=N -> all N-tuples. Patterns from
+                    # different cell-type modisco runs are kept namespaced
+                    # ('HepG2:p3' vs 'K562:p3').
+                    from itertools import combinations as _combos
+                    _row_sets = [sorted(set(m)) for m in _row_motifs]
+                    # Universe of single patterns ranked by # peaks containing
+                    # them — drives the multiselect's display order.
+                    _pat_counts: dict[str, int] = {}
+                    for _s in _row_sets:
+                        for _m in _s:
+                            _pat_counts[_m] = _pat_counts.get(_m, 0) + 1
+                    _patterns_sorted = sorted(_pat_counts.keys(),
+                                              key=lambda c: -_pat_counts[c])
+                    syntax_order = int(st.number_input(
+                        "syntax order", min_value=1, max_value=6, value=2, step=1,
+                        key=f"pc_finemo_order__{color_mode}",
+                        help="N-way co-occurrence: 1=single motif, 2=pairs, 3=triples, …",
+                    ))
+                    _pat_sel = st.multiselect(
+                        "patterns considered",
+                        _patterns_sorted,
+                        default=_patterns_sorted,
+                        key=f"pc_finemo_pats__{color_mode}",
+                        format_func=lambda p: f"{p} ({_pat_counts[p]})",
+                        help="Combos are formed only from patterns selected here. "
+                             "Ordered by global hit count.",
+                    )
+                    top_n = int(st.number_input(
+                        "top N co-occurrences", min_value=1, max_value=20000,
+                        value=1000, step=10,
+                        key=f"pc_finemo_topn__{color_mode}",
+                        help="Show only the top-N most-frequent order-K combos. "
+                             "Motif order within a combo doesn't matter — only "
+                             "co-occurrence in the same sequence.",
+                    ))
+                    _pat_sel_set = set(_pat_sel)
+                    _row_combos: list[list[str]] = []
+                    _combo_counts: dict[str, int] = {}
+                    for _s in _row_sets:
+                        _filtered = [m for m in _s if m in _pat_sel_set]
+                        if len(_filtered) >= syntax_order:
+                            _row_c = ["+".join(c) for c in _combos(_filtered, syntax_order)]
+                        else:
+                            _row_c = []
+                        _row_combos.append(_row_c)
+                        for _c in _row_c:
+                            _combo_counts[_c] = _combo_counts.get(_c, 0) + 1
+                    _cats_sorted = sorted(_combo_counts.keys(),
+                                          key=lambda c: -_combo_counts[c])[:top_n]
+                    _counts_sorted = [_combo_counts[c] for c in _cats_sorted]
+                    _rank = {c: i for i, c in enumerate(_cats_sorted)}
+                    _pal = _extended_palette(max(len(_cats_sorted), 1))
+                    if len(_cats_sorted) > 30:
+                        st.caption(f":warning: {len(_cats_sorted)} categories — palette uses HSL spacing past 12")
+                    _cat_to_hex = {c: _pal[i] for i, c in enumerate(_cats_sorted)}
+                    _row_hex_list: list[str] = []
+                    _excl_list: list[bool] = []
+                    for _row_c in _row_combos:
+                        _best = None
+                        _best_r = len(_cats_sorted)
+                        for _c in _row_c:
+                            _r = _rank.get(_c)
+                            if _r is not None and _r < _best_r:
+                                _best, _best_r = _c, _r
+                        if _best is None:
+                            _row_hex_list.append(_NA_HEX)
+                            _excl_list.append(True)
+                        else:
+                            _row_hex_list.append(_cat_to_hex[_best])
+                            _excl_list.append(False)
+                    _color_arr = np.array(_row_hex_list, dtype="<U7")
+                    _color_is_discrete = True
+                    color_label = f"finemo (order-{syntax_order}, top {len(_cats_sorted)})"
+                    _color_legend = [
+                        (f"{c} ({_counts_sorted[i]})", _cat_to_hex[c])
+                        for i, c in enumerate(_cats_sorted[:30])
+                    ]
+                    if len(_cats_sorted) > 30:
+                        _color_legend.append((f"…and {len(_cats_sorted) - 30} more", _NA_HEX))
+                    _excl = np.array(_excl_list)
+                    if _excl.any():
+                        _excluded_rows_mask = _excl
+                elif _mode == "syntax enrichment":
+                    # Paper-style higher-order motif co-occurrence. For each
+                    # N-tuple of selected patterns:
+                    #   stat = P(t1 ∧ … ∧ tN) − ∏ P(ti)
+                    # i.e. observed joint frequency minus the independence
+                    # baseline. For order=2 this is exactly cov(I_i, I_j).
+                    # Higher orders generalize the same "obs minus expected"
+                    # interpretation but get sparse fast — bump min co-occurrences.
+                    # Sign = enrichment (positive) vs depletion (negative).
+                    # Each peak inherits the color of the in-row tuple with
+                    # the largest |stat| (or |Δstat| in differential mode).
+                    from itertools import combinations as _combos
+                    _row_sets = [set(m) for m in _row_motifs]
+                    _N = len(_row_sets)
+                    _pat_counts: dict[str, int] = {}
+                    for _s in _row_sets:
+                        for _m in _s:
+                            _pat_counts[_m] = _pat_counts.get(_m, 0) + 1
+                    _patterns_sorted = sorted(_pat_counts.keys(),
+                                              key=lambda c: -_pat_counts[c])
+                    order = int(st.number_input(
+                        "order", min_value=2, max_value=5, value=2, step=1,
+                        key=f"pc_finemo_enr_order__{color_mode}",
+                        help="Tuple size: 2=pairs (covariance), 3=triples, etc. "
+                             "obs − ∏ marginals; for order 3+ raise min co-occurrences.",
+                    ))
+                    _pat_sel = st.multiselect(
+                        "patterns considered",
+                        _patterns_sorted,
+                        default=_patterns_sorted[:20],
+                        key=f"pc_finemo_enr_pats__{color_mode}",
+                        format_func=lambda p: f"{p} ({_pat_counts[p]})",
+                        help="Tuples are formed only from patterns selected here.",
+                    )
+                    min_cooccur = int(st.number_input(
+                        "min co-occurrences per tuple", min_value=1,
+                        max_value=10000, value=20, step=1,
+                        key=f"pc_finemo_enr_mincoo__{color_mode}",
+                        help="Drop tuples observed in fewer than K peaks "
+                             "(per-bin in differential mode) — the statistic "
+                             "is noisy for rare combos.",
+                    ))
+                    top_n = int(st.number_input(
+                        "top N tuples", min_value=1, max_value=5000,
+                        value=50, step=1,
+                        key=f"pc_finemo_enr_topn__{color_mode}",
+                    ))
+                    # Sort criterion for top-N + per-peak winner. Variance/range
+                    # across bins (the "mech dim") only available once a bin
+                    # source is committed (differential mode below).
+                    _sort_options_base = ["|stat|", "n (hit count)"]
+                    sort_by = st.selectbox(
+                        "sort tuples by",
+                        _sort_options_base + ["variance across bins", "range across bins"],
+                        index=0,
+                        key=f"pc_finemo_enr_sort__{color_mode}",
+                        help="|stat|: rank by enrichment magnitude. "
+                             "n: rank by raw co-occurrence count. "
+                             "variance/range across bins: dispersion of per-bin "
+                             "stat — finds tuples whose enrichment varies most "
+                             "across the binned activity dimension. The last two "
+                             "require 'differential between bins' below.",
+                    )
+
+                    # Cross-cell-line constraint: every tuple must include
+                    # motifs from ≥ 2 distinct cts. Default ON when ≥ 2 cts
+                    # are loaded — that's the use case Pablo cares about
+                    # (e.g. HepG2:AP1 + K562:AP1 always co-occur in a peak).
+                    if len(_ct_order) >= 2:
+                        cross_ct_only = st.toggle(
+                            "cross-cell-line only",
+                            value=True,
+                            key=f"pc_finemo_enr_xct__{color_mode}",
+                            help="Require each tuple to include motifs from ≥ 2 "
+                                 "distinct cell lines. High stat = patterns from "
+                                 "different model runs systematically co-occur "
+                                 "in the same peak.",
+                        )
+                    else:
+                        cross_ct_only = False
+
+                    def _tuple_ct_count(tup: tuple) -> int:
+                        cts = set()
+                        for _m in tup:
+                            cts.add(_m.split(":", 1)[0] if ":" in _m else "")
+                        return len(cts)
+
+                    # Discover bin setups committed elsewhere in this session.
+                    _avail_bins: list[str] = []
+                    for _ssk, _ssv in list(st.session_state.items()):
+                        if not (_ssk.startswith("pc_bin_set__") and _ssv):
+                            continue
+                        _cm = _ssk[len("pc_bin_set__"):]
+                        if _cm == color_mode:
+                            continue  # current color is discrete; can't bin on itself
+                        _src_arr = None
+                        if _cm == "auto (mean activity)" and "average magnitude" in _color_pool:
+                            _src_arr = np.asarray(_color_pool["average magnitude"][1], dtype=np.float32)
+                        elif _cm in _color_pool and _color_pool[_cm][0] == "continuous":
+                            _src_arr = np.asarray(_color_pool[_cm][1], dtype=np.float32)
+                        if _src_arr is None:
+                            continue
+                        if _src_arr.shape[0] != _N:
+                            continue
+                        _avail_bins.append(_cm)
+
+                    _diff_on = False
+                    _diff_lo_idx = 0
+                    _diff_hi_idx = 1
+                    _diff_src = None
+                    _diff_ranges: list[tuple] = []
+                    _diff_n_bins = 0
+                    if _avail_bins:
+                        _diff_on = st.toggle(
+                            "differential between bins",
+                            value=False,
+                            key=f"pc_finemo_enr_diff__{color_mode}",
+                            help="Compute the statistic separately in two bins of "
+                                 "another continuous metric (set in that color's "
+                                 "bin UI), then color by Δstat = stat_hi − stat_lo.",
+                        )
+                        if _diff_on:
+                            _diff_src = st.selectbox(
+                                "bins from", _avail_bins,
+                                key=f"pc_finemo_enr_diff_src__{color_mode}",
+                            )
+                            # find n_bins committed for this source
+                            _nb_key = f"pc_bin_n_bars__{_diff_src}"
+                            _nb_val = int(st.session_state.get(_nb_key, 1))
+                            _diff_n_bins = _nb_val + 1
+                            _rng_key = f"pc_bin_ranges__{_diff_src}__{_diff_n_bins}"
+                            _diff_ranges = list(st.session_state.get(_rng_key, []))
+                            if not _diff_ranges:
+                                st.caption(":warning: bin source has no committed ranges; falling back to single-pool stat")
+                                _diff_on = False
+                            else:
+                                _bin_choices = [
+                                    f"bin {i+1}: [{_diff_ranges[i][0]:.3g}, {_diff_ranges[i][1]:.3g}]"
+                                    for i in range(_diff_n_bins)
+                                ]
+                                _dc = st.columns(2)
+                                with _dc[0]:
+                                    _diff_lo_idx = int(st.selectbox(
+                                        "low bin", list(range(_diff_n_bins)),
+                                        index=0,
+                                        format_func=lambda i: _bin_choices[i],
+                                        key=f"pc_finemo_enr_diff_lo__{color_mode}",
+                                    ))
+                                with _dc[1]:
+                                    _diff_hi_idx = int(st.selectbox(
+                                        "high bin", list(range(_diff_n_bins)),
+                                        index=_diff_n_bins - 1,
+                                        format_func=lambda i: _bin_choices[i],
+                                        key=f"pc_finemo_enr_diff_hi__{color_mode}",
+                                    ))
+                                if _diff_lo_idx == _diff_hi_idx:
+                                    st.caption(":warning: low and high bins are the same; Δstat will be 0")
+
+                    _pat_sel_set = set(_pat_sel)
+
+                    def _tuple_stats(row_idx_mask: np.ndarray) -> tuple[dict, dict]:
+                        """Return (tuple_n, tuple_stat) over rows where mask is True."""
+                        _Nm = int(row_idx_mask.sum())
+                        _pcounts: dict[str, int] = {}
+                        _tn: dict[tuple, int] = {}
+                        if _Nm == 0:
+                            return _tn, {}
+                        for _ri, _s in enumerate(_row_sets):
+                            if not row_idx_mask[_ri]:
+                                continue
+                            _filt = sorted(_s & _pat_sel_set)
+                            for _m in _filt:
+                                _pcounts[_m] = _pcounts.get(_m, 0) + 1
+                            for _tup in _combos(_filt, order):
+                                if cross_ct_only and _tuple_ct_count(_tup) < 2:
+                                    continue
+                                _tn[_tup] = _tn.get(_tup, 0) + 1
+                        _pi = {m: _pcounts[m] / _Nm for m in _pcounts}
+                        _ts: dict[tuple, float] = {}
+                        for _tup, _n in _tn.items():
+                            if _n < min_cooccur:
+                                continue
+                            _p_obs = _n / _Nm
+                            _p_exp = 1.0
+                            _ok = True
+                            for _m in _tup:
+                                if _m not in _pi:
+                                    _ok = False
+                                    break
+                                _p_exp *= _pi[_m]
+                            if _ok:
+                                _ts[_tup] = _p_obs - _p_exp
+                        return _tn, _ts
+
+                    if _diff_on and _diff_src is not None and _diff_ranges:
+                        # bin assignment per row from the source metric
+                        if _diff_src == "auto (mean activity)":
+                            _src_arr = np.asarray(_color_pool["average magnitude"][1], dtype=np.float32)
+                        else:
+                            _src_arr = np.asarray(_color_pool[_diff_src][1], dtype=np.float32)
+                        _bin_idx = np.full(_N, -1, dtype=np.int32)
+                        for _bk in range(_diff_n_bins):
+                            _blo, _bhi = _diff_ranges[_bk]
+                            _mb = (_src_arr >= _blo) & (_src_arr <= _bhi) & (_bin_idx < 0)
+                            _bin_idx[_mb] = _bk
+                        _mask_lo = (_bin_idx == _diff_lo_idx)
+                        _mask_hi = (_bin_idx == _diff_hi_idx)
+                        _tn_lo, _ts_lo = _tuple_stats(_mask_lo)
+                        _tn_hi, _ts_hi = _tuple_stats(_mask_hi)
+                        _all_keys = set(_ts_lo.keys()) | set(_ts_hi.keys())
+                        _tuple_stat: dict[tuple, float] = {}
+                        for _tup in _all_keys:
+                            _tuple_stat[_tup] = _ts_hi.get(_tup, 0.0) - _ts_lo.get(_tup, 0.0)
+                        _tuple_n_disp = {
+                            _tup: (_tn_lo.get(_tup, 0), _tn_hi.get(_tup, 0))
+                            for _tup in _all_keys
+                        }
+                        _stat_label = "Δstat"
+                    else:
+                        _tn_all, _ts_all = _tuple_stats(np.ones(_N, dtype=bool))
+                        _tuple_stat = _ts_all
+                        _tuple_n_disp = {_tup: _tn_all[_tup] for _tup in _ts_all}
+                        _stat_label = "cov" if order == 2 else "stat"
+
+                    # Per-bin stats for variance/range sorts. Requires the bin
+                    # source from differential mode — _bin_idx + _diff_n_bins.
+                    _per_bin_stats: dict[tuple, list[float]] = {}
+                    _per_bin_n: dict[tuple, list[int]] = {}
+                    _need_per_bin = sort_by in ("variance across bins", "range across bins")
+                    if _need_per_bin:
+                        if not (_diff_on and _diff_src is not None and _diff_ranges):
+                            st.caption(":warning: variance/range sort needs 'differential between bins' on; falling back to |stat|")
+                        else:
+                            for _bk in range(_diff_n_bins):
+                                _bm = (_bin_idx == _bk)
+                                _tn_b, _ts_b = _tuple_stats(_bm)
+                                for _tup, _v in _ts_b.items():
+                                    _per_bin_stats.setdefault(_tup, [0.0] * _diff_n_bins)[_bk] = _v
+                                    _per_bin_n.setdefault(_tup, [0] * _diff_n_bins)[_bk] = _tn_b.get(_tup, 0)
+                            for _tup, _ns in _per_bin_n.items():
+                                # zero out bins where the tuple was below min_cooccur
+                                # (already zero in default; just ensure stats only carry
+                                # contributions from supported bins).
+                                pass
+
+                    def _score_for(tup):
+                        if sort_by == "n (hit count)":
+                            v = _tuple_n_disp.get(tup, 0)
+                            if isinstance(v, tuple):
+                                return float(sum(v))
+                            return float(v)
+                        if sort_by == "variance across bins" and _per_bin_stats:
+                            vals = _per_bin_stats.get(tup)
+                            return float(np.var(vals)) if vals else 0.0
+                        if sort_by == "range across bins" and _per_bin_stats:
+                            vals = _per_bin_stats.get(tup)
+                            return (max(vals) - min(vals)) if vals else 0.0
+                        # default / fallback: |stat|
+                        return abs(_tuple_stat.get(tup, 0.0))
+
+                    _all_universe = set(_tuple_stat.keys()) | set(_per_bin_stats.keys())
+                    _keys_sorted = sorted(
+                        _all_universe, key=lambda k: -_score_for(k)
+                    )[:top_n]
+                    _pal = _extended_palette(max(len(_keys_sorted), 1))
+                    if len(_keys_sorted) > 30:
+                        st.caption(f":warning: {len(_keys_sorted)} tuples — palette uses HSL spacing past 12")
+                    _key_to_hex = {k: _pal[i] for i, k in enumerate(_keys_sorted)}
+                    _key_score = {k: _score_for(k) for k in _keys_sorted}
+                    _row_hex_list: list[str] = []
+                    _excl_list: list[bool] = []
+                    for _s in _row_sets:
+                        _filt = sorted(_s & _pat_sel_set)
+                        _best_k = None
+                        _best_sc = -1.0
+                        if len(_filt) >= order:
+                            for _tup in _combos(_filt, order):
+                                if cross_ct_only and _tuple_ct_count(_tup) < 2:
+                                    continue
+                                _a = _key_score.get(_tup)
+                                if _a is None:
+                                    continue
+                                if _a > _best_sc:
+                                    _best_sc = _a
+                                    _best_k = _tup
+                        if _best_k is None:
+                            _row_hex_list.append(_NA_HEX)
+                            _excl_list.append(True)
+                        else:
+                            _row_hex_list.append(_key_to_hex[_best_k])
+                            _excl_list.append(False)
+                    _color_arr = np.array(_row_hex_list, dtype="<U7")
+                    _color_is_discrete = True
+                    _diff_tag = " Δ" if _diff_on else ""
+                    _sort_tag = {
+                        "|stat|": "|stat|",
+                        "n (hit count)": "n",
+                        "variance across bins": "var",
+                        "range across bins": "range",
+                    }.get(sort_by, sort_by)
+                    color_label = f"finemo (order-{order} {_stat_label}{_diff_tag}, top {len(_keys_sorted)} by {_sort_tag})"
+
+                    def _fmt_n(v):
+                        if isinstance(v, tuple):
+                            return f"n_lo={v[0]}, n_hi={v[1]}"
+                        return f"n={v}"
+
+                    def _legend_for(k):
+                        if sort_by in ("variance across bins", "range across bins") and k in _per_bin_stats:
+                            vals = _per_bin_stats[k]
+                            ns = _per_bin_n.get(k, [0] * len(vals))
+                            _vstr = ", ".join(
+                                f"b{i+1}:{vals[i]:+.3f}(n={ns[i]})" for i in range(len(vals))
+                            )
+                            _sc = _score_for(k)
+                            _tag = "var" if sort_by.startswith("variance") else "range"
+                            return f"{_tag}={_sc:.4f}, [{_vstr}]"
+                        return (f"{_stat_label}={_tuple_stat.get(k, 0.0):+.4f}, "
+                                f"{_fmt_n(_tuple_n_disp.get(k, 0))}")
+
+                    _color_legend = [
+                        (f"{' + '.join(k)} ({_legend_for(k)})", _key_to_hex[k])
+                        for k in _keys_sorted[:30]
+                    ]
+                    if len(_keys_sorted) > 30:
+                        _color_legend.append((f"…and {len(_keys_sorted) - 30} more", _NA_HEX))
+                    _excl = np.array(_excl_list)
+                    if _excl.any():
+                        _excluded_rows_mask = _excl
+                else:
+                    # any hit: categories = all unique namespaced motifs, ranked
+                    # by # peaks containing them.
+                    _row_sets = [set(m) for m in _row_motifs]
+                    _all_motifs: dict[str, int] = {}
+                    for _s in _row_sets:
+                        for _m in _s:
+                            _all_motifs[_m] = _all_motifs.get(_m, 0) + 1
+                    _cats_sorted = sorted(_all_motifs.keys(),
+                                          key=lambda c: -_all_motifs[c])
+                    _counts_sorted = [_all_motifs[c] for c in _cats_sorted]
+                    _default = _cats_sorted[:12]
+                    _sel = st.multiselect(
+                        "show categories", _cats_sorted, default=_default,
+                        key=f"pc_finemo_cats__{color_mode}__{_mode}",
+                        format_func=lambda c: f"{c} ({_counts_sorted[_cats_sorted.index(c)]})",
+                    )
+                    _pal = _extended_palette(max(len(_sel), 1))
+                    if len(_sel) > 30:
+                        st.caption(":warning: many categories — colors may be hard to distinguish")
+                    _cat_to_hex = {c: _pal[i] for i, c in enumerate(_sel)}
+                    _row_hex_list = []
+                    _excl_list = []
+                    for _s in _row_sets:
+                        _hit = next((c for c in _sel if c in _s), None)
+                        if _hit is None:
+                            _row_hex_list.append(_NA_HEX)
+                            _excl_list.append(True)
+                        else:
+                            _row_hex_list.append(_cat_to_hex[_hit])
+                            _excl_list.append(False)
+                    _color_arr = np.array(_row_hex_list, dtype="<U7")
+                    _color_is_discrete = True
+                    color_label = "finemo (any hit)"
+                    _legend_pairs = []
+                    for c in _sel[:30]:
+                        _cnt = _counts_sorted[_cats_sorted.index(c)] if c in _cats_sorted else 0
+                        _legend_pairs.append((f"{c} ({_cnt})", _cat_to_hex[c]))
+                    if len(_sel) > 30:
+                        _legend_pairs.append((f"…and {len(_sel) - 30} more", _NA_HEX))
+                    _color_legend = _legend_pairs
+                    _excl = np.array(_excl_list)
+                    if _excl.any():
+                        _excluded_rows_mask = _excl
+
+        # Highlight one category at a time — non-matching rows turn grey
+        # (and shrink in opacity) while the selected category's points render
+        # last so they sit on top of the muted background, even when the
+        # category is a tiny minority. Stacks on top of the multiselect filter.
+        _highlight_hex = ""
+        if _color_is_discrete and _color_legend and len(_color_legend) >= 2:
+            _hl_opts = ["none"] + [_l for _l, _ in _color_legend
+                                   if _l and not _l.startswith("…and ")]
+            _hl = st.selectbox(
+                "highlight category (others greyed)",
+                _hl_opts, index=0, key=f"pc_highlight_cat__{color_mode}",
+                help="Pick one category from the legend. The selected category "
+                     "is drawn on top of the rest of the cloud, which is muted "
+                     "to grey — same effect as clicking the corresponding "
+                     "KDE curve.",
             )
-        st.markdown("<br>".join(_rows), unsafe_allow_html=True)
-    plot_fig_w = int(st.slider("figure width (px)", 400, 2400, 900, 50, key="pc_w"))
-    plot_fig_h = int(st.slider("figure height (px)", 300, 1200, 600, 50, key="pc_h"))
-    _MARG = ["none", "counts", "density", "probability"]
-    plot_marg_x = st.selectbox("marginal x", _MARG, index=0, key="pc_mx")
-    plot_marg_y = st.selectbox("marginal y", _MARG, index=0, key="pc_my")
-    plot_auto_lims = st.checkbox("auto axis limits", value=True, key="pc_autolims")
-    plot_xmin: float | None = None
-    plot_xmax: float | None = None
-    plot_ymin: float | None = None
-    plot_ymax: float | None = None
-    if not plot_auto_lims:
-        _xc1, _xc2 = st.columns(2)
-        plot_xmin = float(_xc1.number_input("xmin", value=-3.0, step=0.1, key="pc_xmin"))
-        plot_xmax = float(_xc2.number_input("xmax", value= 3.0, step=0.1, key="pc_xmax"))
-        _yc1, _yc2 = st.columns(2)
-        plot_ymin = float(_yc1.number_input("ymin", value=-1.0, step=0.1, key="pc_ymin"))
-        plot_ymax = float(_yc2.number_input("ymax", value= 1.0, step=0.1, key="pc_ymax"))
-    show_finemo_hits = st.checkbox("show FiNeMo hits", value=False, key="pc_finemo")
-    highlight_csv = int(st.number_input("highlight csv row", value=-1, step=1, key="pc_highlight",
-                                        help="-1 to disable; otherwise show a marker at this row"))
+            if _hl != "none":
+                _hl_hex = next((_h for _l, _h in _color_legend if _l == _hl), None)
+                if _hl_hex:
+                    _highlight_hex = str(_hl_hex)
+                    _color_arr = np.where(
+                        np.asarray(_color_arr) == _hl_hex,
+                        _color_arr, _NA_HEX,
+                    ).astype("<U7")
+
+        # Inline binning controls — work on whatever continuous metric is currently
+        # selected as the color. Toggling discretizes that metric into N bins with
+        # X distinct categorical colors from _PALETTE; the gradient preview only
+        # appears in the in-between state (toggle on, bins not yet committed).
+        if _continuous_metric_arr is not None:
+            _bin_state_key = f"pc_bin_active__{color_mode}"
+            _enable_bin = st.toggle(
+                "discretize into bins",
+                value=bool(st.session_state.get(_bin_state_key, False)),
+                key=f"pc_bin_enable__{color_mode}",
+            )
+            st.session_state[_bin_state_key] = _enable_bin
+            if _enable_bin:
+                _metric_arr = _continuous_metric_arr.astype(np.float32, copy=False)
+                _finite = _metric_arr[np.isfinite(_metric_arr)]
+                if _finite.size == 0:
+                    st.caption("metric has no finite values — cannot bin")
+                else:
+                    _dmin, _dmax = float(_finite.min()), float(_finite.max())
+                    n_bars = int(st.number_input(
+                        "# bars", min_value=1, max_value=11, value=2, step=1,
+                        key=f"pc_bin_n_bars__{color_mode}",
+                        help="Bars define the bin edges. # bins = # bars + 1."))
+                    n_bins = n_bars + 1
+                    _step = (_dmax - _dmin) / 200.0 if _dmax > _dmin else 0.01
+                    _key_tag = f"{color_mode}__{n_bins}"
+                    # Each bin holds its own independent (lo, hi). Bins can
+                    # overlap or leave gaps; rows that fall in no bin's range
+                    # are "unbinned" and excluded from the scatter. When bins
+                    # overlap, the lowest-index bin wins.
+                    _ranges_key = f"pc_bin_ranges__{_key_tag}"
+                    if _ranges_key not in st.session_state:
+                        _q = np.linspace(0.0, 1.0, n_bins + 1)
+                        _qedges = np.quantile(_finite, _q).tolist()
+                        _qedges = [float(np.clip(e, _dmin, _dmax)) for e in _qedges]
+                        st.session_state[_ranges_key] = [
+                            (float(_qedges[i]), float(_qedges[i + 1]))
+                            for i in range(n_bins)
+                        ]
+                    _ranges = list(st.session_state[_ranges_key])
+                    _bin_colors = _extended_palette(n_bins)
+
+                    def _on_bin_change(k: int,
+                                       _kt: str = _key_tag,
+                                       _rk: str = _ranges_key):
+                        sk = f"pc_bin_range_{k}__{_kt}"
+                        v = st.session_state[sk]
+                        new_ranges = list(st.session_state[_rk])
+                        new_ranges[k] = (float(min(v)), float(max(v)))
+                        st.session_state[_rk] = new_ranges
+
+                    _excluded_set: set[int] = set()
+                    for k in range(n_bins):
+                        _blo, _bhi = _ranges[k]
+                        _sl_key = f"pc_bin_range_{k}__{_key_tag}"
+                        _inc_key = f"pc_bin_inc_{k}__{_key_tag}"
+                        if _sl_key not in st.session_state:
+                            st.session_state[_sl_key] = (float(_blo), float(_bhi))
+                        _bcols = st.columns([0.12, 0.10, 0.78])
+                        with _bcols[0]:
+                            _inc = st.checkbox(
+                                f"include bin {k+1}",
+                                value=True, key=_inc_key,
+                                label_visibility="collapsed",
+                            )
+                        with _bcols[1]:
+                            st.markdown(
+                                f"<div style='width:14px;height:14px;"
+                                f"background:{_bin_colors[k]};border-radius:2px;"
+                                f"margin-top:8px;'></div>",
+                                unsafe_allow_html=True,
+                            )
+                        with _bcols[2]:
+                            st.slider(
+                                f"bin {k+1}",
+                                min_value=_dmin, max_value=_dmax,
+                                value=(float(_blo), float(_bhi)),
+                                step=_step,
+                                key=_sl_key,
+                                label_visibility="collapsed",
+                                on_change=_on_bin_change, args=(k,),
+                            )
+                        if not _inc:
+                            _excluded_set.add(k)
+                    _ranges = list(st.session_state[_ranges_key])
+
+                    _set_key = f"pc_bin_set__{color_mode}"
+                    _bins_set = bool(st.session_state.get(_set_key, False))
+                    _btn_label = "unset bins" if _bins_set else "set bins"
+                    if st.button(_btn_label, key=f"pc_bin_btn__{color_mode}",
+                                 use_container_width=True):
+                        _bins_set = not _bins_set
+                        st.session_state[_set_key] = _bins_set
+                    # Digitize against full_edges (length n_bins+1). Values
+                    # below full_edges[0] → idx=-1, above full_edges[N] → idx=n_bins.
+                    # Both cases are "unbinned" and excluded from the scatter.
+                    # Per-bin membership: lowest-index bin whose [lo, hi]
+                    # contains the value wins (matters when bins overlap).
+                    _idx_raw = np.full(_metric_arr.shape, -1, dtype=np.int32)
+                    for _bk in range(n_bins):
+                        _blo, _bhi = _ranges[_bk]
+                        _mask = (
+                            (_metric_arr >= _blo)
+                            & (_metric_arr <= _bhi)
+                            & (_idx_raw < 0)
+                        )
+                        _idx_raw[_mask] = _bk
+                    _unbinned_mask = (_idx_raw < 0)
+                    _idx = np.where(_unbinned_mask, 0, _idx_raw)
+                    _bin_labels = [
+                        f"[{_ranges[i][0]:.3g}, {_ranges[i][1]:.3g}]"
+                        for i in range(n_bins)
+                    ]
+                    if _bins_set:
+                        # state C: discrete coloring with distinct palette colors,
+                        # no gradient strip. Excluded bins + unbinned rows are
+                        # filtered via _excluded_rows_mask.
+                        _row_color = np.array(
+                            [_bin_colors[i] for i in _idx], dtype="<U30"
+                        )
+                        _na_mask = ~np.isfinite(_metric_arr) | _unbinned_mask
+                        _row_color[_na_mask] = _NA_HEX
+                        _color_arr = _row_color
+                        _color_is_discrete = True
+                        color_label = f"{color_mode} (bins)"
+                        _color_legend = list(zip(_bin_labels, _bin_colors))
+                        _bin_export_name = f"bin_{color_mode}"
+                        _bin_export_per_row_label = np.array(
+                            [_bin_labels[i] for i in _idx], dtype=object
+                        )
+                        _bin_export_per_row_label[_na_mask] = "NA"
+                        _exc = _unbinned_mask & np.isfinite(_metric_arr)
+                        if _excluded_set:
+                            _exc = _exc | (
+                                np.isin(_idx, np.array(list(_excluded_set)))
+                                & np.isfinite(_metric_arr)
+                                & ~_unbinned_mask
+                            )
+                        if _exc.any():
+                            _excluded_rows_mask = _exc
+                        _n_unbinned = int((_unbinned_mask & np.isfinite(_metric_arr)).sum())
+                        _bits = [f"bins applied · {n_bins} bins"]
+                        if _excluded_set:
+                            _bits.append(f"{len(_excluded_set)} excluded")
+                        if _n_unbinned:
+                            _bits.append(f"{_n_unbinned} unbinned")
+                        st.caption(" · ".join(_bits))
+                    else:
+                        # state B: continuous coloring + gradient preview with bars.
+                        _grad = go.Figure(go.Heatmap(
+                            z=np.linspace(0.0, 1.0, 256).reshape(-1, 1),
+                            y=np.linspace(_dmin, _dmax, 256),
+                            colorscale=plot_colorscale,
+                            showscale=False, hoverinfo="skip",
+                        ))
+                        # One pair of hlines per bin so gaps/overlaps are visible.
+                        for _bk, (_blo, _bhi) in enumerate(_ranges):
+                            _bc = _bin_colors[_bk]
+                            _grad.add_hline(y=_blo, line=dict(color=_bc, width=2))
+                            _grad.add_hline(y=_bhi, line=dict(color=_bc, width=2))
+                        _grad.update_layout(
+                            height=int(st.session_state.get("pc_h", 600)),
+                            width=120,
+                            margin=dict(l=10, r=40, t=30, b=40),
+                            template="plotly_white",
+                            yaxis=dict(range=[_dmin, _dmax], title=color_mode,
+                                       side="right", showgrid=False),
+                            xaxis=dict(showticklabels=False, showgrid=False,
+                                       zeroline=False, fixedrange=True),
+                        )
+                        _color_grad_fig = _grad
+                        st.caption("preview — click `set bins` to apply discrete coloring")
+        # Library-categorical legend (custom-bins legend is rendered inline above).
+        if _color_is_discrete and _color_legend and _bin_export_name is None:
+            _rows = []
+            for _cat, _hex in _color_legend[:12]:
+                _txt = str(_cat)
+                if len(_txt) > 28:
+                    _txt = _txt[:27] + "…"
+                _rows.append(
+                    f"<span style='display:inline-block;width:10px;height:10px;"
+                    f"background:{_hex};border-radius:2px;margin-right:4px;'></span>{_txt}"
+                )
+            st.markdown("<br>".join(_rows), unsafe_allow_html=True)
+    with st.expander("layout", expanded=False):
+        plot_dot_size = int(st.slider("dot size", 1, 12, 4, 1, key="pc_dot_size"))
+        plot_fig_w = int(st.slider("figure width (px)", 400, 2400, 900, 50, key="pc_w"))
+        plot_fig_h = int(st.slider("figure height (px)", 300, 1200, 600, 50, key="pc_h"))
+        plot_auto_lims = st.checkbox("auto axis limits", value=True, key="pc_autolims")
+        plot_xmin: float | None = None
+        plot_xmax: float | None = None
+        plot_ymin: float | None = None
+        plot_ymax: float | None = None
+        if not plot_auto_lims:
+            _xc1, _xc2 = st.columns(2)
+            plot_xmin = float(_xc1.number_input("xmin", value=-3.0, step=0.1, key="pc_xmin"))
+            plot_xmax = float(_xc2.number_input("xmax", value= 3.0, step=0.1, key="pc_xmax"))
+            _yc1, _yc2 = st.columns(2)
+            plot_ymin = float(_yc1.number_input("ymin", value=-1.0, step=0.1, key="pc_ymin"))
+            plot_ymax = float(_yc2.number_input("ymax", value= 1.0, step=0.1, key="pc_ymax"))
+    with st.expander("marginals", expanded=False):
+        _MARG = ["none", "counts", "density", "probability"]
+        plot_marg_x = st.selectbox("marginal x", _MARG, index=0, key="pc_mx")
+        plot_marg_y = st.selectbox("marginal y", _MARG, index=0, key="pc_my")
+        plot_marg_norm = st.selectbox(
+            "norm (discrete only)",
+            ["global", "per-category", "per-bin"],
+            index=0, key="pc_marg_norm",
+            help=(
+                "global: each category's smoothed KDE scaled by its share of "
+                "total → stacks to the overall density.\n"
+                "per-category: every category drawn as a PDF (area=1), "
+                "overlaid → peak shapes directly comparable.\n"
+                "per-bin: at each x, share of categories at that x; stacks "
+                "to 1 everywhere → reveals where each category dominates."
+            ),
+        )
+    with st.expander("overlays", expanded=False):
+        show_finemo_hits = st.checkbox("show FiNeMo hits", value=False, key="pc_finemo")
+        highlight_csv = int(st.number_input("highlight csv row", value=-1, step=1, key="pc_highlight",
+                                            help="-1 to disable; otherwise show a marker at this row"))
 
 # Apply x/y axis overrides BEFORE the `valid` mask is built so finite-filtering
 # sees the user-chosen arrays. Axis titles are also updated to reflect the choice.
@@ -1266,6 +2298,8 @@ else:
     if _color_arr is None:
         _color_arr = np.full(common_csv.shape[0], np.nan, dtype=np.float32)
     valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(_color_arr)
+if _excluded_rows_mask is not None:
+    valid &= ~_excluded_rows_mask
 
 _x = np.ascontiguousarray(x[valid], dtype=np.float64)
 _y = np.ascontiguousarray(y[valid], dtype=np.float64)
@@ -1278,8 +2312,8 @@ else:
     _color = np.ascontiguousarray(_color_arr[valid], dtype=np.float64)
     _marg_color = _color
     if _color.size and np.isfinite(_color).any():
-        _lo, _hi = np.nanpercentile(_color, [2, 98])
-        _vmin, _vmax = float(_lo), float(_hi)
+        _vmin = float(np.nanmin(_color))
+        _vmax = float(np.nanmax(_color))
     else:
         _vmin = _vmax = None
 
@@ -1311,6 +2345,10 @@ fig = _scatter_fig(
     _dragmode, _boxes_hash,
     int(plot_dot_size),
     bool(_color_is_discrete),
+    bool(_color_grad_fig is None),
+    str(plot_marg_norm),
+    tuple((str(_h), str(_l)) for _l, _h in (_color_legend or [])),
+    str(_highlight_hex or ""),
     _x, _y, _custom, _color, _marg_color,
     _boxes=_boxes,
 )
@@ -1373,8 +2411,13 @@ with _center:
                     if _p is not None:
                         _pred_arrays[f"pred_{_sname}"] = _p
                 _attr_slots[f"attr_{_sname}"] = s
+            # If custom-bins coloring is active, expose the per-row bin label
+            # as an opt-in download column.
+            _extra_arrays: dict[str, np.ndarray] = {}
+            if _bin_export_name is not None and _bin_export_per_row_label is not None:
+                _extra_arrays[_bin_export_name] = _bin_export_per_row_label
             _all_opts = ["seq_idx"] + _lib_cols + list(_pred_arrays.keys()) \
-                      + list(_attr_slots.keys())
+                      + list(_attr_slots.keys()) + list(_extra_arrays.keys())
             _default_cols = ["seq_idx", "name", "chr_hg38", "start_hg38", "stop_hg38", "sequence"] \
                           + list(_pred_arrays.keys()) + list(_attr_slots.keys())
             _default_cols = [c for c in _default_cols if c in _all_opts]
@@ -1419,6 +2462,8 @@ with _center:
                         _df[_rename.get(c, c)] = library[c].iloc[_rows].to_numpy()
                     elif c in _pred_arrays:
                         _df[c] = _pred_arrays[c][_rows_pos]
+                    elif c in _extra_arrays:
+                        _df[c] = _extra_arrays[c][_rows_pos]
                     elif c in _attr_views:
                         s, _attr = _attr_views[c]
                         _npz = s["attr_csv_to_npz"][_rows]
@@ -1454,13 +2499,27 @@ with _center:
     _abc_tag = "-".join(str(i) for i in ABC) if ABC else "none"
     _scatter_key = f"scatter__{_slot_key_tag}__{_abc_tag}"
     _sel_modes = ("points", "box") if _isolate_mode else ("points",)
-    event = st.plotly_chart(
-        fig,
-        use_container_width=False,
-        on_select="rerun",
-        selection_mode=_sel_modes,
-        key=_scatter_key,
-    )
+    if _color_grad_fig is not None:
+        _scat_col, _grad_col = st.columns([6, 1])
+        with _scat_col:
+            event = st.plotly_chart(
+                fig,
+                use_container_width=False,
+                on_select="rerun",
+                selection_mode=_sel_modes,
+                key=_scatter_key,
+            )
+        with _grad_col:
+            st.plotly_chart(_color_grad_fig, use_container_width=False,
+                            key=f"{_scatter_key}__bingrad")
+    else:
+        event = st.plotly_chart(
+            fig,
+            use_container_width=False,
+            on_select="rerun",
+            selection_mode=_sel_modes,
+            key=_scatter_key,
+        )
 
 
 # --- isolate-mode: capture a new box selection ---

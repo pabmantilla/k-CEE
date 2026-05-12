@@ -70,6 +70,45 @@ def eigenmaps_score(imp_a: np.ndarray, imp_b: np.ndarray,
     return (var_ratio * c01).astype(np.float32)
 
 
+def dev_from_shared_eig(imp_list: list[np.ndarray], weighted: bool = False) -> np.ndarray:
+    """Per-sequence deviation from shared via eigendecomposition.
+
+    For each sequence i, build the N_ct x N_ct covariance C of z-normalized
+    importance across the cell-type stacks, eigendecompose, take the dominant
+    eigenvector EI_1, and compute its unsigned alignment with the shared
+    direction (1,...,1)/sqrt(N_ct). Returns 1 - |EI_1 . shared|.
+
+    Sign-invariant; range [0, 1]. 0 = perfectly shared, 1 = orthogonal.
+
+    If `weighted=True`, multiply by var_ratio_1 = lam_max / sum(lam) — analog
+    of 2D `eigenmaps_score = var_ratio * r`. Sequences whose top eigenvector
+    captures little variance get down-weighted.
+
+    Matches the notebook's "unsigned angle from shared" metric (here returned
+    as 1 - cos(angle) so larger = more deviated, units 0..1).
+    """
+    if len(imp_list) < 2:
+        raise ValueError("Need at least 2 importance stacks.")
+    n = min(a.shape[0] for a in imp_list)
+    z = np.stack(
+        [_z_normalize_per_row(a[:n].astype(np.float64)) for a in imp_list],
+        axis=1,
+    )  # (n, n_ct, L)
+    L = z.shape[2]
+    n_ct = z.shape[1]
+    C = np.einsum('njk,nlk->njl', z, z) / L  # (n, n_ct, n_ct)
+    eigvals, eigvecs = np.linalg.eigh(C)  # ascending; top = last column
+    ei1 = eigvecs[..., -1]                # (n, n_ct)
+    shared = np.ones(n_ct, dtype=np.float64) / np.sqrt(n_ct)
+    proj = np.clip(np.abs(ei1 @ shared), 0.0, 1.0)
+    dev = 1.0 - proj
+    if weighted:
+        total = eigvals.sum(axis=-1)
+        var_ratio = np.where(total > 0, eigvals[..., -1] / total, 0.0)
+        dev = dev * var_ratio
+    return dev.astype(np.float32)
+
+
 def deviation_from_shared(imp_list: list[np.ndarray]) -> np.ndarray:
     """Per-sequence deviation from the equiangular ray across cell types.
 

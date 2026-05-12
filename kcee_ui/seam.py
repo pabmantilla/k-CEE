@@ -252,7 +252,7 @@ def _scatter_fig(df: pd.DataFrame, mask: np.ndarray, scores: dict[str, np.ndarra
                 symbol=TYPE_SYMBOL[tp],
                 line=dict(width=0),
                 showscale=(ti == 0),
-                colorbar=dict(title=color_label) if ti == 0 else None,
+                colorbar=dict(title=dict(text=color_label, side="right")) if ti == 0 else None,
             )
             if vmin is not None:
                 marker["cmin"] = float(vmin)
@@ -459,8 +459,9 @@ def render() -> None:
             color_mode = st.selectbox("color by", _COLOR_MODES, index=0, key="seam_pc_color")
             plot_colorscale = st.selectbox(
                 "colorscale",
-                ["Viridis", "Plasma", "Magma", "Turbo", "Cividis", "RdBu_r", "Inferno"],
+                ["Viridis", "Cividis", "Plasma", "Magma", "Inferno", "RdBu_r", "PuOr_r"],
                 index=0, key="seam_pc_cmap",
+                help="All options are colorblind-friendly. Viridis/Cividis/Plasma/Magma/Inferno are sequential; RdBu_r and PuOr_r are diverging (centered around 0).",
             )
             plot_clip_mode = st.radio("color clipping", ["auto (2–98%)", "manual", "full range"],
                                       index=0, key="seam_pc_clip")

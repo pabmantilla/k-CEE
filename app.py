@@ -18,7 +18,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from kcee_ui.loader import load_attr_file, list_attr_keys
-from kcee_ui.scoring import cossim_score, eigenmaps_score, deviation_from_shared, attr_to_importance
+from kcee_ui.scoring import cossim_score, eigenmaps_score, deviation_from_shared, dev_from_shared_eig, attr_to_importance
 from kcee_ui.plotting import plot_attribution, cached_attribution_png
 from kcee_ui.data import load_library, seq_to_onehot
 from kcee_ui.finemo import load_finemo_hits
@@ -424,7 +424,14 @@ if loaded:
         ABC = [a_idx, b_idx, c_idx]
 
 
-# --- sidebar: library annotation (color / filter by any library column) ---
+# Plot controls container is created here so the library-category picker (which
+# must run before scoring to populate annot_filter_mask) and the rest of the
+# plot controls (rendered after scoring) share the same bordered panel.
+_ctrl, _center = st.columns([1, 4])
+_pc = _ctrl.container(border=True)
+_pc.markdown("**Plot controls**")
+
+# --- plot controls: library annotation (color / filter by any library column) ---
 # Pick any library CSV column (e.g. `category` with values like 'promoter',
 # 'putative enhancer, HepG2') to (a) filter common_csv to a subset and/or
 # (b) color the scatter by that column. Filter applies BEFORE scoring so
@@ -442,8 +449,8 @@ if library is not None:
         and library[c].nunique(dropna=True) <= 200
     ]
     if _eligible_annot_cols:
-        st.sidebar.header("Library annotation")
-        annot_col = st.sidebar.selectbox(
+        _pc.markdown("**library category**")
+        annot_col = _pc.selectbox(
             "column", ["(none)"] + _eligible_annot_cols, index=0,
             key=f"annot_col__{_slot_key_tag}",
             help="Library CSV column for filter/color (e.g. 'category').",
@@ -452,7 +459,7 @@ if library is not None:
             annot_col = None
         if annot_col is not None:
             annot_values = sorted(library[annot_col].dropna().astype(str).unique().tolist())
-            _picked = st.sidebar.multiselect(
+            _picked = _pc.multiselect(
                 f"filter {annot_col} (empty = all)",
                 annot_values, default=[],
                 key=f"annot_vals__{annot_col}",
@@ -606,6 +613,41 @@ def _dev_full(paths: tuple[tuple[str, str], ...], csv_path: str,
     return cached_npy("dev_full", deps, _go)
 
 
+@st.cache_data(show_spinner="computing deviation from shared (eig)…")
+def _dev_eig_full(paths: tuple[tuple[str, str], ...], csv_path: str,
+                  map_hashes: tuple[str, ...], insert_offsets: tuple[int, ...],
+                  weighted: bool,
+                  _maps: tuple[np.ndarray, ...]) -> np.ndarray:
+    """Per-CSV-row deviation-from-shared via eigendecomposition of the
+    per-sequence cell-type-by-cell-type covariance of z-normalized importance.
+    `weighted=False` -> cossim-style (unweighted); `weighted=True` -> EigenMaps-
+    style (multiplied by var_ratio_1). Range [0, 1] either way."""
+    deps = ("dev_eig",) + tuple((p, k, _mtime(p), mh, int(off))
+                                 for (p, k), mh, off in zip(paths, map_hashes, insert_offsets)) \
+                       + (csv_path, len(_maps), bool(weighted), "v1")
+
+    def _go():
+        assert_pair_aligned(*[(f"slot{i}", m) for i, m in enumerate(_maps)])
+        imps_full: list[np.ndarray] = []
+        for (p, k), mh, off, m in zip(paths, map_hashes, insert_offsets, _maps):
+            imp = _cached_importance(p, k, csv_path, mh, int(off), m)
+            lo, hi = _var_window(int(off), int(imp.shape[1]))
+            imps_full.append(imp[:, lo:hi])
+        common = np.ones(_maps[0].shape[0], dtype=bool)
+        for m in _maps:
+            common &= (m >= 0)
+        out = np.full(_maps[0].shape[0], np.nan, dtype=np.float32)
+        if int(common.sum()) > 0:
+            sub = [imp[m[common]] for imp, m in zip(imps_full, _maps)]
+            sub = [np.where(np.isfinite(x), x, np.float32(0.0)) for x in sub]
+            min_L = min(s.shape[1] for s in sub)
+            sub = [s[:, :min_L] for s in sub]
+            out[common] = dev_from_shared_eig(sub, weighted=bool(weighted))
+        return out
+
+    return cached_npy("dev_eig_full", deps, _go)
+
+
 scores: np.ndarray | None = None  # aligned to `common_csv` (below)
 score_label = "—"
 score_cmap = "Viridis"
@@ -659,7 +701,16 @@ if loaded and ABC and library is not None:
                 score_cmap = "Inferno"
             except Exception as e:
                 st.sidebar.error(str(e))
-    else:  # 3D
+    else:  # 3D — mech axis is "deviation from shared" via eigendecomposition
+        score_mode = st.sidebar.selectbox(
+            "score (mech axis)", ["cossim", "EigenMaps"],
+            index=0, key="score_mode_3d",
+            help=(
+                "Deviation from shared: eigendecompose per-sequence covariance of z-normalised "
+                "importance across the 3 cell types, return 1 - |EI_1 · shared_dir|. "
+                "EigenMaps weights this by var_ratio_1 (matches the 2D eigenmaps_score = var_ratio*r convention)."
+            ),
+        )
         if len(set(ABC)) >= 2:
             try:
                 paths = tuple((s["path"], s["key"]) for s in sl_subset)
@@ -669,10 +720,13 @@ if loaded and ABC and library is not None:
                     _resolve_insert_offset(s, int(_cached_attr_shape(s["path"], s["key"])[2]))
                     for s in sl_subset
                 )
-                scores_full = _dev_full(paths, csv_path, map_hashes, insert_offsets, maps)
+                weighted = (score_mode == "EigenMaps")
+                scores_full = _dev_eig_full(paths, csv_path, map_hashes, insert_offsets,
+                                            weighted, maps)
                 scores = scores_full[common_csv]
-                score_label = f"dev_from_shared({', '.join(short_name(s['name']) for s in sl_subset)})"
-                score_cmap = "Turbo"
+                _names = ", ".join(short_name(s["name"]) for s in sl_subset)
+                score_label = f"deviation from shared [{score_mode}]({_names})"
+                score_cmap = "Inferno" if weighted else "Magma"
             except Exception as e:
                 st.sidebar.error(str(e))
         else:
@@ -821,8 +875,12 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
                  xmin: float | None, xmax: float | None,
                  ymin: float | None, ymax: float | None,
                  highlight_csv: int,
+                 dragmode: str, boxes_hash: str,
+                 dot_size: int,
+                 discrete: bool,
                  _x: np.ndarray, _y: np.ndarray, _custom: np.ndarray,
-                 _color: np.ndarray, _marg_color: np.ndarray) -> go.Figure:
+                 _color: np.ndarray, _marg_color: np.ndarray,
+                 _boxes: list | None = None) -> go.Figure:
     has_marg = (marg_x != "none") or (marg_y != "none")
     if has_marg:
         fig = make_subplots(
@@ -835,17 +893,25 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
         fig = go.Figure()
         scatter_row = scatter_col = None
 
-    marker = dict(
-        size=4,
-        color=_color,
-        colorscale=colorscale,
-        opacity=0.7,
-        colorbar=dict(title=color_label),
-    )
-    if vmin is not None:
-        marker["cmin"] = float(vmin)
-    if vmax is not None:
-        marker["cmax"] = float(vmax)
+    if discrete:
+        marker = dict(size=dot_size, color=_color, opacity=0.7)
+        _hover = "csv_row=%{customdata}<br>x=%{x:.3f}<br>mech=%{y:.3f}<extra></extra>"
+    else:
+        marker = dict(
+            size=dot_size,
+            color=_color,
+            colorscale=colorscale,
+            opacity=0.7,
+            colorbar=dict(title=dict(text=color_label, side="right")),
+        )
+        if vmin is not None:
+            marker["cmin"] = float(vmin)
+        if vmax is not None:
+            marker["cmax"] = float(vmax)
+        _hover = (
+            "csv_row=%{customdata}<br>x=%{x:.3f}"
+            "<br>mech=%{y:.3f}<br>color=%{marker.color:.3f}<extra></extra>"
+        )
 
     scatter = go.Scattergl(
         x=_x,
@@ -853,10 +919,7 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
         mode="markers",
         marker=marker,
         customdata=_custom,
-        hovertemplate=(
-            "csv_row=%{customdata}<br>x=%{x:.3f}"
-            "<br>mech=%{y:.3f}<br>color=%{marker.color:.3f}<extra></extra>"
-        ),
+        hovertemplate=_hover,
         selected=dict(marker=dict(opacity=0.7)),
         unselected=dict(marker=dict(opacity=0.7)),
         name="",
@@ -865,7 +928,7 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
     if has_marg:
         fig.add_trace(scatter, row=scatter_row, col=scatter_col)
         if marg_x != "none":
-            out = _binned_mean(_x, _marg_color, bins=30)
+            out = None if discrete else _binned_mean(_x, _marg_color, bins=30)
             if out is not None:
                 centers, widths, counts, means = out
                 hn = marg_x
@@ -906,7 +969,7 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
                         row=1, col=1,
                     )
         if marg_y != "none":
-            out = _binned_mean(_y, _marg_color, bins=30)
+            out = None if discrete else _binned_mean(_y, _marg_color, bins=30)
             if out is not None:
                 centers, widths, counts, means = out
                 hn = marg_y
@@ -960,7 +1023,7 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
         height=int(fig_h),
         margin=dict(l=40, r=20, t=30, b=40),
         template="plotly_white",
-        dragmode="zoom",
+        dragmode=dragmode,
     )
     if xmin is not None and xmax is not None:
         if has_marg:
@@ -989,111 +1052,31 @@ def _scatter_fig(score_label: str, color_label: str, xaxis_label: str,
                 fig.add_trace(hl, row=2, col=1)
             else:
                 fig.add_trace(hl)
+    for _i, b in enumerate(_boxes or []):
+        shape_kw = dict(
+            type="rect", x0=b["x0"], y0=b["y0"], x1=b["x1"], y1=b["y1"],
+            line=dict(color=b["color"], width=2),
+            fillcolor=b["color"], opacity=0.10, layer="above",
+        )
+        if has_marg:
+            fig.add_shape(row=2, col=1, **shape_kw)
+        else:
+            fig.add_shape(**shape_kw)
+        m = (_x >= b["x0"]) & (_x <= b["x1"]) & (_y >= b["y0"]) & (_y <= b["y1"])
+        if int(m.sum()) > 0:
+            overlay = go.Scattergl(
+                x=_x[m], y=_y[m], mode="markers",
+                marker=dict(size=dot_size, color=b["color"], opacity=0.9),
+                customdata=_custom[m],
+                hovertemplate="csv_row=%{customdata}<extra></extra>",
+                showlegend=False, name=f"box {_i + 1}",
+            )
+            if has_marg:
+                fig.add_trace(overlay, row=2, col=1)
+            else:
+                fig.add_trace(overlay)
     return fig
 
-
-_ctrl, _center = st.columns([1, 4])
-
-with _ctrl:
-    with st.container(border=True):
-        st.markdown("**Plot controls**")
-        plot_colorscale = st.selectbox(
-            "colorscale",
-            ["Viridis", "Plasma", "Magma", "Turbo", "Cividis", "RdBu_r", "Inferno"],
-            index=0,
-            key="pc_cmap",
-        )
-        plot_clip_mode = st.radio(
-            "color clipping",
-            ["auto (2–98%)", "manual", "full range"],
-            index=0,
-            key="pc_clip",
-        )
-        plot_vmin: float | None = None
-        plot_vmax: float | None = None
-        if plot_clip_mode == "manual":
-            plot_vmin = float(st.number_input("vmin", value=0.0, key="pc_vmin"))
-            plot_vmax = float(st.number_input("vmax", value=1.0, key="pc_vmax"))
-        pred_cts = [s["name"] for s in (loaded[i] for i in ABC) if s.get("pred_key")]
-        if MODE_MODELS:
-            meas_cts = [models_ct] if (models_ct and f"{models_ct}_log2FC" in library.columns) else []
-            resid_cts = [s["name"] for s in (loaded[i] for i in ABC)
-                         if s.get("pred_key") and models_ct
-                         and f"{models_ct}_log2FC" in library.columns]
-        else:
-            meas_cts = [s["cell_type"] for s in (loaded[i] for i in ABC)
-                        if f"{s['cell_type']}_log2FC" in library.columns]
-            resid_cts = [s["cell_type"] for s in (loaded[i] for i in ABC)
-                         if s.get("pred_key") and f"{s['cell_type']}_log2FC" in library.columns]
-        _ax_kind = (
-            "method" if k_condition == "methods"
-            else ("model" if MODE_MODELS else "cell line")
-        )
-        _xaxis_color_label = (
-            "model prediction difference (x-axis)"
-            if MODE_MODELS else "log2FC HepG2 vs K562 (x-axis)"
-        )
-        _COLOR_MODES = [
-            "average magnitude",
-            f"predicted activity ({_ax_kind})",
-            f"measured log2FC ({'cell line' if not MODE_MODELS else 'cell line'})",
-            f"predicted − measured residual ({_ax_kind})",
-            "score (y-axis)",
-            _xaxis_color_label,
-        ]
-        _CM_ANNOT = f"library: {annot_col}" if annot_col else None
-        if _CM_ANNOT:
-            _COLOR_MODES.append(_CM_ANNOT)
-        color_mode = st.selectbox(
-            "color by",
-            _COLOR_MODES,
-            index=0,
-            key="pc_color",
-        )
-        # Normalize color_mode to canonical keys used in the resolution branches.
-        _CM_PRED = f"predicted activity ({_ax_kind})"
-        _CM_MEAS = f"measured log2FC ({'cell line' if not MODE_MODELS else 'cell line'})"
-        _CM_RESID = f"predicted − measured residual ({_ax_kind})"
-        _CM_XAXIS = _xaxis_color_label
-        if color_mode == _CM_PRED and not pred_cts:
-            color_mode = "average magnitude"
-        elif color_mode == _CM_MEAS and not meas_cts:
-            color_mode = "average magnitude"
-        elif color_mode == _CM_RESID and not resid_cts:
-            color_mode = "average magnitude"
-        color_cell_line = None
-        if color_mode == _CM_PRED and pred_cts:
-            color_cell_line = st.selectbox(_ax_kind, pred_cts, index=0, key="pc_color_ct_pred")
-        elif color_mode == _CM_MEAS and meas_cts:
-            color_cell_line = st.selectbox("cell line", meas_cts, index=0, key="pc_color_ct_meas")
-        elif color_mode == _CM_RESID and resid_cts:
-            color_cell_line = st.selectbox(_ax_kind, resid_cts, index=0, key="pc_color_ct_resid")
-        plot_fig_w = int(st.slider("figure width (px)", 400, 2400, 900, 50, key="pc_w"))
-        plot_fig_h = int(st.slider("figure height (px)", 300, 1200, 600, 50, key="pc_h"))
-        _MARG = ["none", "counts", "density", "probability"]
-        plot_marg_x = st.selectbox("marginal x", _MARG, index=0, key="pc_mx")
-        plot_marg_y = st.selectbox("marginal y", _MARG, index=0, key="pc_my")
-        plot_auto_lims = st.checkbox("auto axis limits", value=True, key="pc_autolims")
-        plot_xmin: float | None = None
-        plot_xmax: float | None = None
-        plot_ymin: float | None = None
-        plot_ymax: float | None = None
-        if not plot_auto_lims:
-            _xc1, _xc2 = st.columns(2)
-            plot_xmin = float(_xc1.number_input("xmin", value=-3.0, step=0.1, key="pc_xmin"))
-            plot_xmax = float(_xc2.number_input("xmax", value= 3.0, step=0.1, key="pc_xmax"))
-            _yc1, _yc2 = st.columns(2)
-            plot_ymin = float(_yc1.number_input("ymin", value=-1.0, step=0.1, key="pc_ymin"))
-            plot_ymax = float(_yc2.number_input("ymax", value= 1.0, step=0.1, key="pc_ymax"))
-        show_finemo_hits = st.checkbox("show FiNeMo hits", value=False, key="pc_finemo")
-        highlight_csv = int(st.number_input("highlight csv row", value=-1, step=1, key="pc_highlight",
-                                            help="-1 to disable; otherwise show a marker at this row"))
-
-# Build the shared color array (aligned to common_csv) driven by the
-# unified "color by" control. Both the scatter and the marginals use
-# this same array by design.
-_color_arr = None
-color_label = "—"
 
 def _slot_by_name(name):
     return next((s for s in (loaded[i] for i in ABC) if s.get("name") == name), None)
@@ -1120,84 +1103,199 @@ def _measured_for(ct):
         return None
     return library[col].iloc[common_csv].to_numpy(dtype=np.float32, copy=False)
 
-if color_mode == _CM_PRED and color_cell_line:
-    arr = _predicted_for(_slot_by_name(color_cell_line))
-    if arr is not None:
-        _color_arr = arr
-        color_label = f"predicted ({short_name(color_cell_line)})"
+with _pc:
+    # Colorscale follows the per-score-type default (RdBu_r / Inferno / Magma).
+    plot_colorscale = score_cmap
+    plot_dot_size = int(st.slider("dot size", 1, 12, 4, 1, key="pc_dot_size"))
+    # Build the x/y axis chooser pool. Each option maps to an array aligned to common_csv.
+    _axis_pool: dict[str, np.ndarray | None] = {"auto": None}
+    for s in (loaded[i] for i in ABC):
+        col = f"{s['cell_type']}_log2FC"
+        if col in library.columns:
+            _axis_pool[f"measured {s['cell_type']}_log2FC"] = (
+                library[col].iloc[common_csv].to_numpy(dtype=np.float32, copy=False)
+            )
+    for s in (loaded[i] for i in ABC):
+        if s.get("pred_key"):
+            _ppred = _predicted_for(s)
+            if _ppred is not None:
+                _axis_pool[f"predicted ({short_name(s['name'])})"] = _ppred
+    _axis_pool["score (mech axis)"] = np.asarray(scores, dtype=np.float32)
+    if "HepG2_log2FC" in library.columns and "K562_log2FC" in library.columns:
+        _hk = library[["HepG2_log2FC", "K562_log2FC"]].iloc[common_csv].values
+        _axis_pool["log2FC HepG2 − K562"] = (_hk[:, 0] - _hk[:, 1]).astype(np.float32)
+    _abc_slots = [loaded[i] for i in ABC]
+    if len(_abc_slots) >= 2 and _abc_slots[0].get("pred_key") and _abc_slots[1].get("pred_key"):
+        _pa = _predicted_for(_abc_slots[0])
+        _pb = _predicted_for(_abc_slots[1])
+        if _pa is not None and _pb is not None:
+            _axis_pool["pred(A) − pred(B)"] = (_pa - _pb).astype(np.float32)
+    _axis_opts = list(_axis_pool.keys())
+    x_axis_choice = st.selectbox("x-axis", _axis_opts, index=0, key="pc_xaxis")
+    y_axis_choice = st.selectbox("y-axis", _axis_opts, index=0, key="pc_yaxis")
 
-elif color_mode == _CM_MEAS and color_cell_line:
-    arr = _measured_for(color_cell_line)
-    if arr is not None:
-        _color_arr = arr
-        color_label = f"measured log2FC ({color_cell_line})"
-
-elif color_mode == _CM_RESID and color_cell_line:
-    if MODE_MODELS:
-        pred = _predicted_for(_slot_by_name(color_cell_line))
-        meas = _measured_for(models_ct)
-        resid_tag = f"{short_name(color_cell_line)} − {models_ct}"
-    else:
-        pred = _predicted_for(_slot_by_ct(color_cell_line))
-        meas = _measured_for(color_cell_line)
-        resid_tag = color_cell_line
-    if pred is not None and meas is not None:
-        _color_arr = (pred - meas).astype(np.float32)
-        color_label = f"residual ({resid_tag})"
-
-elif color_mode == "score (y-axis)":
-    _color_arr = np.asarray(scores, dtype=np.float32)
-    color_label = score_label
-
-elif color_mode == _CM_XAXIS:
-    _color_arr = np.asarray(x, dtype=np.float32)
-    color_label = _xaxis_label.replace("   [func]", "").strip()
-
-elif annot_col and _CM_ANNOT and color_mode == _CM_ANNOT and annot_codes is not None:
-    codes = annot_codes[common_csv].astype(np.float32)
-    _color_arr = np.where(codes < 0, np.nan, codes)
-    color_label = f"library: {annot_col}"
-
-if _color_arr is None:
-    sl_subset_for_color = [loaded[i] for i in ABC]
-    _color_stack = []
-    _color_slot_names: list[str] = []
-    for s in sl_subset_for_color:
-        arr = _predicted_for(s)
-        if arr is None:
+    # Unified color pool: continuous entries reuse axis arrays; residual entries
+    # are pred-minus-measured; library categorical columns produce discrete entries.
+    _color_pool: dict[str, tuple] = {}
+    for _k, _v in _axis_pool.items():
+        if _k == "auto" or _v is None:
             continue
-        _color_stack.append(arr)
-        _color_slot_names.append(short_name(s["name"]))
-    if _color_stack:
-        _color_arr = np.nanmean(np.vstack(_color_stack), axis=0)
-        color_label = f"mean activity ({', '.join(_color_slot_names)})"
-    else:
-        _color_arr = np.full(common_csv.shape[0], np.nan, dtype=np.float32)
-        color_label = "mean activity (n/a)"
+        _color_pool[_k] = ("continuous", _v)
+    # residuals: one per ABC slot with pred_key + matching log2FC column
+    for s in (loaded[i] for i in ABC):
+        if not s.get("pred_key"):
+            continue
+        if MODE_MODELS:
+            if not models_ct or f"{models_ct}_log2FC" not in library.columns:
+                continue
+            _pred = _predicted_for(s)
+            _meas = _measured_for(models_ct)
+            _tag = f"{short_name(s['name'])} − {models_ct}"
+        else:
+            _ct = s.get("cell_type")
+            if not _ct or f"{_ct}_log2FC" not in library.columns:
+                continue
+            _pred = _predicted_for(s)
+            _meas = _measured_for(_ct)
+            _tag = f"{short_name(s['name'])} − {_ct}"
+        if _pred is None or _meas is None:
+            continue
+        _color_pool[f"residual ({_tag})"] = ("continuous", (_pred - _meas).astype(np.float32))
+    # legacy "average magnitude" — mean of predictions across ABC
+    _avg_stack = []
+    for s in (loaded[i] for i in ABC):
+        _ap = _predicted_for(s)
+        if _ap is not None:
+            _avg_stack.append(_ap)
+    if _avg_stack:
+        _color_pool["average magnitude"] = (
+            "continuous", np.nanmean(np.vstack(_avg_stack), axis=0).astype(np.float32),
+        )
+    # discrete library columns: ≤20 unique non-null values, eligible columns only
+    _PALETTE = ["#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00",
+                "#CC79A7", "#999999", "#882255", "#117733", "#88CCEE", "#AA4499"]
+    _NA_HEX = "#BDBDBD"
+    if library is not None:
+        for _col in library.columns:
+            if _col in ("sequence", "csv_row", "name"):
+                continue
+            if _col.endswith("_log2FC") or _col.endswith("_hg38"):
+                continue
+            _vals = library[_col].dropna()
+            _nu = _vals.nunique()
+            if _nu == 0 or _nu > 20:
+                continue
+            _cats = sorted(_vals.astype(str).unique().tolist())
+            _palette_map = {c: _PALETTE[i % len(_PALETTE)] for i, c in enumerate(_cats)}
+            _per_row_cat = library[_col].astype("string").iloc[common_csv].fillna("NA").to_numpy()
+            _per_row_hex = np.array(
+                [_palette_map.get(str(v), _NA_HEX) for v in _per_row_cat], dtype="<U7"
+            )
+            _color_pool[f"library: {_col}"] = ("discrete", _per_row_hex, _palette_map)
 
-valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(_color_arr)
+    _color_opts = ["auto (mean activity)"] + list(_color_pool.keys())
+    color_mode = st.selectbox("color by", _color_opts, index=0, key="pc_color")
+
+    _color_arr = None
+    _color_is_discrete = False
+    _color_legend: list[tuple[str, str]] = []
+    color_label = "—"
+    if color_mode == "auto (mean activity)":
+        if "average magnitude" in _color_pool:
+            _color_arr = _color_pool["average magnitude"][1]
+            color_label = "mean activity"
+        else:
+            _color_arr = np.full(common_csv.shape[0], np.nan, dtype=np.float32)
+            color_label = "mean activity (n/a)"
+    else:
+        _entry = _color_pool.get(color_mode)
+        if _entry is not None and _entry[0] == "continuous":
+            _color_arr = np.asarray(_entry[1], dtype=np.float32)
+            color_label = color_mode
+        elif _entry is not None and _entry[0] == "discrete":
+            _color_arr = _entry[1]
+            _color_is_discrete = True
+            color_label = color_mode
+            _color_legend = [(k, v) for k, v in _entry[2].items()]
+    if _color_is_discrete and _color_legend:
+        _rows = []
+        for _cat, _hex in _color_legend[:12]:
+            _txt = str(_cat)
+            if len(_txt) > 28:
+                _txt = _txt[:27] + "…"
+            _rows.append(
+                f"<span style='display:inline-block;width:10px;height:10px;"
+                f"background:{_hex};border-radius:2px;margin-right:4px;'></span>{_txt}"
+            )
+        st.markdown("<br>".join(_rows), unsafe_allow_html=True)
+    plot_fig_w = int(st.slider("figure width (px)", 400, 2400, 900, 50, key="pc_w"))
+    plot_fig_h = int(st.slider("figure height (px)", 300, 1200, 600, 50, key="pc_h"))
+    _MARG = ["none", "counts", "density", "probability"]
+    plot_marg_x = st.selectbox("marginal x", _MARG, index=0, key="pc_mx")
+    plot_marg_y = st.selectbox("marginal y", _MARG, index=0, key="pc_my")
+    plot_auto_lims = st.checkbox("auto axis limits", value=True, key="pc_autolims")
+    plot_xmin: float | None = None
+    plot_xmax: float | None = None
+    plot_ymin: float | None = None
+    plot_ymax: float | None = None
+    if not plot_auto_lims:
+        _xc1, _xc2 = st.columns(2)
+        plot_xmin = float(_xc1.number_input("xmin", value=-3.0, step=0.1, key="pc_xmin"))
+        plot_xmax = float(_xc2.number_input("xmax", value= 3.0, step=0.1, key="pc_xmax"))
+        _yc1, _yc2 = st.columns(2)
+        plot_ymin = float(_yc1.number_input("ymin", value=-1.0, step=0.1, key="pc_ymin"))
+        plot_ymax = float(_yc2.number_input("ymax", value= 1.0, step=0.1, key="pc_ymax"))
+    show_finemo_hits = st.checkbox("show FiNeMo hits", value=False, key="pc_finemo")
+    highlight_csv = int(st.number_input("highlight csv row", value=-1, step=1, key="pc_highlight",
+                                        help="-1 to disable; otherwise show a marker at this row"))
+
+# Apply x/y axis overrides BEFORE the `valid` mask is built so finite-filtering
+# sees the user-chosen arrays. Axis titles are also updated to reflect the choice.
+if x_axis_choice != "auto" and _axis_pool.get(x_axis_choice) is not None:
+    x = np.asarray(_axis_pool[x_axis_choice], dtype=np.float32)
+    _xaxis_label = x_axis_choice
+if y_axis_choice != "auto" and _axis_pool.get(y_axis_choice) is not None:
+    y = np.asarray(_axis_pool[y_axis_choice], dtype=np.float32)
+    score_label = y_axis_choice
+
+# Shared color array (aligned to common_csv) was resolved inside _pc above.
+# Discrete colors are per-row hex strings; continuous is a numeric array.
+if _color_is_discrete:
+    valid = np.isfinite(x) & np.isfinite(y)
+else:
+    if _color_arr is None:
+        _color_arr = np.full(common_csv.shape[0], np.nan, dtype=np.float32)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(_color_arr)
 
 _x = np.ascontiguousarray(x[valid], dtype=np.float64)
 _y = np.ascontiguousarray(y[valid], dtype=np.float64)
 _custom = np.ascontiguousarray(common_csv[valid], dtype=np.int64)
-_color = np.ascontiguousarray(_color_arr[valid], dtype=np.float64)
-_marg_color = _color
-
-# Resolve vmin/vmax per the clipping mode.
-if plot_clip_mode == "auto (2–98%)":
+if _color_is_discrete:
+    _color = np.ascontiguousarray(_color_arr[valid])
+    _marg_color = _color
+    _vmin = _vmax = None
+else:
+    _color = np.ascontiguousarray(_color_arr[valid], dtype=np.float64)
+    _marg_color = _color
     if _color.size and np.isfinite(_color).any():
         _lo, _hi = np.nanpercentile(_color, [2, 98])
         _vmin, _vmax = float(_lo), float(_hi)
     else:
         _vmin = _vmax = None
-elif plot_clip_mode == "manual":
-    _vmin, _vmax = plot_vmin, plot_vmax
-else:  # full range
-    if _color.size and np.isfinite(_color).any():
-        _vmin = float(np.nanmin(_color))
-        _vmax = float(np.nanmax(_color))
-    else:
-        _vmin = _vmax = None
+
+st.session_state.setdefault("isolate_mode", False)
+st.session_state.setdefault("isolate_boxes", [])
+st.session_state.setdefault("isolate_next_id", 1)
+st.session_state.setdefault("isolate_last_box_hash", None)
+_BOX_PALETTE = ["#E69F00", "#56B4E9", "#009E73", "#F0E442",
+                "#0072B2", "#D55E00", "#CC79A7", "#999999"]
+_isolate_mode = bool(st.session_state["isolate_mode"])
+_boxes = list(st.session_state["isolate_boxes"])
+_dragmode = "select" if _isolate_mode else "zoom"
+_boxes_hash = hashlib.sha1(
+    repr([(b["_uid"], round(b["x0"], 6), round(b["x1"], 6),
+           round(b["y0"], 6), round(b["y1"], 6), b["color"]) for b in _boxes]).encode()
+).hexdigest()[:16]
 
 fig = _scatter_fig(
     score_label, color_label, _xaxis_label,
@@ -1210,29 +1308,189 @@ fig = _scatter_fig(
     plot_fig_w, plot_fig_h, plot_marg_x, plot_marg_y,
     plot_xmin, plot_xmax, plot_ymin, plot_ymax,
     int(highlight_csv),
+    _dragmode, _boxes_hash,
+    int(plot_dot_size),
+    bool(_color_is_discrete),
     _x, _y, _custom, _color, _marg_color,
+    _boxes=_boxes,
 )
 
 with _center:
+    _tb_left, _tb_mid, _tb_right = st.columns([1, 6, 2])
+    with _tb_left:
+        st.toggle("isolate", key="isolate_mode")
+    with _tb_mid:
+        if _boxes:
+            _chip_cols = st.columns([1] * len(_boxes) + [2])
+            for _ci, _b in enumerate(_boxes):
+                _bm = ((_x >= _b["x0"]) & (_x <= _b["x1"]) &
+                       (_y >= _b["y0"]) & (_y <= _b["y1"]))
+                _bn = int(_bm.sum())
+                with _chip_cols[_ci]:
+                    st.markdown(
+                        f"<span style='display:inline-block;width:10px;height:10px;"
+                        f"background:{_b['color']};border-radius:2px;margin-right:4px;'></span>"
+                        f"box {_ci + 1} · {_bn}",
+                        unsafe_allow_html=True,
+                    )
+                    # Delete uses the stable internal _uid (not the displayed
+                    # 1-based position) so widget keys don't collide and
+                    # numbering renumbers naturally after deletion.
+                    if st.button("✕", key=f"del_box_{_b['_uid']}"):
+                        st.session_state["isolate_boxes"] = [
+                            x for x in st.session_state["isolate_boxes"] if x["_uid"] != _b["_uid"]
+                        ]
+                        st.rerun()
+    with _tb_right:
+        _no_boxes = (len(_boxes) == 0)
+        with st.popover("download lib", disabled=_no_boxes):
+            _box_opts = [b["_uid"] for b in _boxes]
+            _uid_to_pos = {b["_uid"]: i + 1 for i, b in enumerate(_boxes)}
+            _box_labels = {
+                b["_uid"]: f"box {i + 1} · {int(((_x >= b['x0']) & (_x <= b['x1']) & (_y >= b['y0']) & (_y <= b['y1'])).sum())} rows · {b['color']}"
+                for i, b in enumerate(_boxes)
+            }
+            _sel_box_uids = st.multiselect(
+                "include boxes", options=_box_opts,
+                default=_box_opts,
+                format_func=lambda u: _box_labels.get(u, str(u)),
+                key="dl_boxes",
+            )
+            # Compact column scheme: rename verbose library columns + per-slot prediction
+            # arrays for every selected (ABC) slot. Defaults match the "input-like"
+            # set (seq_idx, name, chr, start, stop, sequence) + predictions.
+            _rename = {"chr_hg38": "chr", "start_hg38": "start", "stop_hg38": "stop"}
+            _lib_cols = ["name", "chr_hg38", "start_hg38", "stop_hg38", "sequence",
+                         "HepG2_log2FC", "K562_log2FC", "WTC11_log2FC", "category", "str_hg38"]
+            _lib_cols = [c for c in _lib_cols if c in library.columns]
+            _pred_arrays: dict[str, np.ndarray] = {}
+            # Per-slot full hypothetical attribution; resolved lazily per-box.
+            _attr_slots: dict[str, dict] = {}
+            for s in (loaded[i] for i in ABC):
+                _sname = short_name(s["name"])
+                if s.get("pred_key"):
+                    _p = _predicted_for(s)
+                    if _p is not None:
+                        _pred_arrays[f"pred_{_sname}"] = _p
+                _attr_slots[f"attr_{_sname}"] = s
+            _all_opts = ["seq_idx"] + _lib_cols + list(_pred_arrays.keys()) \
+                      + list(_attr_slots.keys())
+            _default_cols = ["seq_idx", "name", "chr_hg38", "start_hg38", "stop_hg38", "sequence"] \
+                          + list(_pred_arrays.keys()) + list(_attr_slots.keys())
+            _default_cols = [c for c in _default_cols if c in _all_opts]
+            _sel_cols = st.multiselect(
+                "columns",
+                options=_all_opts,
+                default=_default_cols,
+                format_func=lambda c: _rename.get(c, c),
+                key="dl_cols",
+                help="`attr_<slot>` = full hypothetical attribution (4×L = 800 floats per row, space-separated, row-major A→T). Importance is sequence·attr — derive downstream if needed.",
+            )
+            _round = int(st.number_input("float decimals", value=4, min_value=0, max_value=8,
+                                          step=1, key="dl_round"))
+            # Pre-resolve mmap'd attribution for the slots whose attr_<slot> column
+            # the user picked. mmap'd reads are O(1); per-row slicing happens inside
+            # the box loop below.
+            _attr_views: dict[str, tuple[dict, np.ndarray]] = {}
+            for c in _sel_cols:
+                if c in _attr_slots:
+                    s = _attr_slots[c]
+                    try:
+                        _attr_views[c] = (s, np.asarray(_cached_load(s["path"], s["key"])))
+                    except Exception as e:
+                        st.warning(f"{c}: {e}")
+            _frames = []
+            _unique_rows: set[int] = set()
+            for _b in _boxes:
+                if _b["_uid"] not in _sel_box_uids:
+                    continue
+                _bm = ((_x >= _b["x0"]) & (_x <= _b["x1"]) &
+                       (_y >= _b["y0"]) & (_y <= _b["y1"]))
+                _rows = _custom[_bm]
+                _rows_pos = np.nonzero(_bm)[0]  # positions in common_csv (for prediction arrays)
+                if _rows.size == 0:
+                    continue
+                _df = pd.DataFrame(index=range(_rows.size))
+                _fmt = f"%.{_round}f"
+                for c in _sel_cols:
+                    if c == "seq_idx":
+                        _df["seq_idx"] = _rows
+                    elif c in library.columns:
+                        _df[_rename.get(c, c)] = library[c].iloc[_rows].to_numpy()
+                    elif c in _pred_arrays:
+                        _df[c] = _pred_arrays[c][_rows_pos]
+                    elif c in _attr_views:
+                        s, _attr = _attr_views[c]
+                        _npz = s["attr_csv_to_npz"][_rows]
+                        # Flatten (4, L) row-major into a single space-separated string.
+                        _df[c] = [
+                            " ".join(_fmt % v for v in np.asarray(_attr[int(i)]).ravel())
+                            if 0 <= int(i) < _attr.shape[0] else ""
+                            for i in _npz
+                        ]
+                _df["box_id"] = _uid_to_pos[_b["_uid"]]
+                _frames.append(_df)
+                _unique_rows.update(int(r) for r in _rows.tolist())
+            st.caption(f"{len(_sel_box_uids)} box(es), {len(_unique_rows)} unique rows")
+            if _frames:
+                _combined = pd.concat(_frames, axis=0, ignore_index=True)
+                _csv = _combined.to_csv(index=False, float_format=f"%.{_round}f").encode()
+                st.download_button(
+                    "download CSV",
+                    data=_csv,
+                    file_name="kcee_subsets.csv",
+                    mime="text/csv",
+                )
+        if not _no_boxes:
+            if st.button("clear boxes", key="clear_boxes"):
+                st.session_state["isolate_boxes"] = []
+                st.session_state["isolate_last_box_hash"] = None
+                st.rerun()
+
     # Per-mode chart key: when k-condition or slot selection changes, the
     # scatter's customdata shape/contents change. Reusing a single "scatter"
     # key across modes leaves Streamlit holding stale selection state, so
     # clicks (and the red highlight lookup) silently miss in models mode.
     _abc_tag = "-".join(str(i) for i in ABC) if ABC else "none"
     _scatter_key = f"scatter__{_slot_key_tag}__{_abc_tag}"
+    _sel_modes = ("points", "box") if _isolate_mode else ("points",)
     event = st.plotly_chart(
         fig,
         use_container_width=False,
         on_select="rerun",
-        selection_mode=("points",),
+        selection_mode=_sel_modes,
         key=_scatter_key,
     )
 
 
+# --- isolate-mode: capture a new box selection ---
+# Hash latest box geometry and only append on change, else every rerun
+# re-adds the same selection.
+if _isolate_mode and event is not None:
+    _ev_sel = getattr(event, "selection", None)
+    _ev_boxes = (_ev_sel.get("box") if _ev_sel else None) or []
+    if _ev_boxes:
+        _bx = _ev_boxes[-1]
+        _xs = _bx.get("x") or []
+        _ys = _bx.get("y") or []
+        if len(_xs) == 2 and len(_ys) == 2:
+            _x0, _x1 = sorted([float(_xs[0]), float(_xs[1])])
+            _y0, _y1 = sorted([float(_ys[0]), float(_ys[1])])
+            _h = f"{round(_x0,6)},{round(_x1,6)},{round(_y0,6)},{round(_y1,6)}"
+            if _h != st.session_state.get("isolate_last_box_hash"):
+                _nid = int(st.session_state["isolate_next_id"])
+                _color = _BOX_PALETTE[(_nid - 1) % len(_BOX_PALETTE)]
+                st.session_state["isolate_boxes"].append(
+                    {"_uid": _nid, "x0": _x0, "x1": _x1, "y0": _y0, "y1": _y1, "color": _color}
+                )
+                st.session_state["isolate_next_id"] = _nid + 1
+                st.session_state["isolate_last_box_hash"] = _h
+                st.rerun()
+
 # --- selected point: csv row ---
 sel_csv: int | None = None
 sel = getattr(event, "selection", None) if event is not None else None
-if sel and sel.get("points"):
+if not _isolate_mode and sel and sel.get("points"):
     pts = [p for p in sel["points"] if p.get("customdata") is not None]
     if pts:
         pt = pts[0]

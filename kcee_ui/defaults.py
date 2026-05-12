@@ -29,7 +29,7 @@ _ATTR_DIR = Path(os.environ.get(
 ))
 
 _KOO_DIR    = _ATTR_DIR / "koo_standardtorch"
-_PABLO_DIR  = _ATTR_DIR / "pablo_ag_ft"
+_PABLO_DIR  = _ATTR_DIR / "pablo_ag_ft_apr15"
 _LEGNET_DIR = _ATTR_DIR / "legnet_ensemble"
 
 # Manifest = the 56,975-row library subset that every canonical attribution

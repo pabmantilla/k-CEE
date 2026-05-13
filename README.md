@@ -11,6 +11,17 @@ cd ~/projects/kcee-ui
 uv sync
 ```
 
+## Data
+
+Attribution files live in `data/attributions/`, one subfolder per model family:
+
+- `koo_standardtorch/` — Koo-lab AlphaGenome fine-tunes (`{HepG2,K562,WTC11}_{deeplift,saliency,intgrad}.h5`)
+- `pablo_ag_ft_apr15/` — Pablo AG fine-tunes
+- `legnet_ensemble/` — MPRA-LegNet 10-fold ensemble
+- `manifest.csv` — 56,975-row library subset every `.h5` is indexed against
+
+First-time setup: drop the bundle into `data/attributions/` (or point `KCEE_ATTR_DIR` at it). The UI auto-discovers any `(family, cell_type, method)` whose `.h5` exists on disk.
+
 ## Run
 
 ```bash

@@ -36,6 +36,7 @@ SEAM_ROOT = Path(
 )
 FG_DIR = SEAM_ROOT / "results" / "foregrounds"
 LIB_PKL = SEAM_ROOT / "libraries" / "hippo_target_library.pkl"
+STACKED_NPZ = SEAM_ROOT / "results" / "seam_maps_v1.npz"
 
 CELL_TYPES = ("HepG2", "K562")
 TYPES = ("wt", "foreground", "background")
@@ -85,27 +86,15 @@ def _load_library() -> pd.DataFrame:
         return pickle.load(f)["df"].reset_index(drop=True)
 
 
-@st.cache_data(show_spinner="loading SEAM maps (1059 × 3 × 2)…")
+@st.cache_data(show_spinner="loading SEAM maps…")
 def _stack_maps() -> tuple[dict[tuple[str, str], np.ndarray], np.ndarray, list[int]]:
-    df = _load_library()
-    seq_idxs = [int(x) for x in df["seq_idx"].values]
-    N = len(seq_idxs)
-    maps: dict[tuple[str, str], np.ndarray] = {}
-    for ct in CELL_TYPES:
-        for tp in ("wt", "foreground"):
-            arr = np.zeros((N, 4, 230), dtype=np.float32)
-            fname = TYPE_FILE[tp]
-            for i, sid in enumerate(seq_idxs):
-                arr[i] = np.load(FG_DIR / ct / str(sid) / fname).T
-            maps[(tp, ct)] = arr
-        # background = intra-cluster bg at ref cluster
-        arr = np.zeros((N, 4, 230), dtype=np.float32)
-        for i, sid in enumerate(seq_idxs):
-            arr[i] = _load_intra_bg(FG_DIR / ct / str(sid)).T
-        maps[("background", ct)] = arr
-    onehot = np.zeros((N, 4, 230), dtype=np.float32)
-    for i, seq in enumerate(df["sequence"].astype(str).tolist()):
-        onehot[i] = seq_to_onehot(seq, length=230, offset=0)
+    # Pre-baked by tools/build_seam_maps.py; one read instead of ~8.4k tiny np.loads.
+    z = np.load(STACKED_NPZ)
+    maps: dict[tuple[str, str], np.ndarray] = {
+        (tp, ct): z[f"{tp}__{ct}"] for tp in TYPES for ct in CELL_TYPES
+    }
+    onehot = z["onehot"]
+    seq_idxs = [int(x) for x in z["seq_idxs"]]
     return maps, onehot, seq_idxs
 
 

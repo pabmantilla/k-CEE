@@ -1,5 +1,131 @@
 # kcee-ui — version log
 
+## v0.13.3 — 2026-05-12
+- **`method` radio (`kmeans` / `gmm`) at top of the cluster block.** Checkbox label flips to `cluster by kmeans/gmm`; session key `pc_kmeans_enable` and downstream label/centroid/t-SNE plumbing unchanged.
+- **`covariance_type` selectbox for GMM** (`full` / `tied` / `diag` / `spherical`, default `full`); rendered only when method is `gmm`. Cache key extended with `(method, gmm_cov)`.
+- **Download column rename `cluster_kmeans` → `cluster_label`** so it isn't method-specific. t-SNE panel title now reads `t-SNE of cluster feature space (…)`.
+- Files: `app.py`.
+
+## v0.13.2 — 2026-05-12
+- **SEAM cold-load: 141 s → 0.22 s.** Replaced the per-seq loop in `_stack_maps` (~8.4k tiny `np.load` calls — 1059 seqs × 2 cell types × {wt, foreground_scaled, full cluster_backgrounds.npy}) with a single `np.load` of a pre-baked `seam_maps_v1.npz` (27.3 MB, all 6 arrays + onehot + seq_idxs).
+- New pre-bake script `tools/build_seam_maps.py` writes the npz to `SEAM_target_spaces/results/seam_maps_v1.npz`. Re-run whenever upstream foregrounds change.
+- Files: `kcee_ui/seam.py`, `tools/build_seam_maps.py` (new).
+
+## v0.13.1 — 2026-05-12
+- **t-SNE diagnostic panel** rendered below the main scatter, gated behind a new `show t-SNE embedding` checkbox inside the k-means block (only shown when k-means is committed).
+- **Inline controls**: `perplexity` (5–50, default 30), `random_state`, and a `run t-SNE` button that gates the compute. Caption reflects state (`no embedding yet` / `embedding ready · perplexity=p · seed=rs`).
+- **Reuses the standardized k-means feature matrix** (`_X_full[_fit_mask]`, optionally standardized) as the t-SNE input. Cache keyed by `(km_hash, perplexity, random_state)`; embedding stored as `(N_full, 2) float32` with NaN for excluded rows. `D < 2` fallback drops the t-SNE call and places the 1D values on x with y=0.
+- **Colored by k-means cluster id** (one Scattergl trace per cluster, ordered by count DESC, same `_extended_palette(k)` as the main scatter). Black-ringed centroid markers over the mean (x, y) per cluster. Clicking a point feeds the same `sel_csv` row-picker as the main scatter.
+- Files: `app.py`.
+
+## v0.13.0 — 2026-05-12
+- **`cluster by k-means` toggle in the `color` expander** — fully independent of the `discretize into bins` toggle (both can be on at once; when both are committed, bins drive color and k-means contributes the centroid overlay + download column only).
+- **Features dropdown** (no default — first option is the `— pick features —` placeholder): `(x, y)` / `mech only (y-axis value)` / `func only (x-axis value)` / `(x, y) + active color metric` (only when the current color is a continuous metric) / `single mech: pairwise cossim` / `single mech: EI_1 / eigenmaps`. Single-mech entries reuse the cached `_cossim_full` / `_eigenmaps_full` / `_dev_eig_full(weighted=True)` calls (no duplicated plumbing).
+- **Full-dataset fit + stable label caching across filters.** Cache key hashes features+k+std+random_state+x/y/color tags+the valid-row csv index set, so toggling other filters does not retrigger the fit. Labels stored under `pc_kmeans_labels__<hash>`, aligned to `common_csv` with `-1` for rows excluded from the fit.
+- **Compute-cost warning** before `set clusters` when `N_valid * k > 200_000` OR `N_valid * D * k * 300 * 10 > 5e9`. `set clusters` is the gate; no separate "compute anyway" button.
+- **Centroid overlay** drawn on top of the scatter (black-ringed dots, `size = max(12, dot_size*2)`, hover `cluster i · n=count`). Centroids projected back to (x, y); 1D features use the cluster-member mean for the missing axis; the color-metric dim is dropped for `(x, y) + active color metric`.
+- **`cluster_kmeans` opt-in download column** in the `download lib` popover (default-off, value `cluster_{i}` per row, empty for excluded).
+- Files: `app.py`, `pyproject.toml`, `uv.lock` (added `scikit-learn`).
+
+## v0.12.4 — 2026-05-11
+- **Per-bin marginal normalization.** New `marginals → per-bin normalize (discrete only)` checkbox: when on, each category's marginal histogram is divided by ITS OWN finite count instead of the global count, so a small bin's distribution is comparable to a dominant bin's. Switches `barmode` from `stack → overlay` (with 0.55 opacity per bar) so per-bin distributions are visible without geometric stacking. Threaded as `per_bin_norm: bool` through `_scatter_fig` → `_add_discrete_marg`.
+- **Bins no longer have to span the full data range.** Each bin's range slider now exposes BOTH thumbs as fully draggable across `[dmin, dmax]`. Source of truth shifted from inner-edge list (length N−1) to `_full_edges` (length N+1), where `full_edges[0]` is bin 0's left thumb and `full_edges[N]` is bin N−1's right thumb. Session_state key renamed to `pc_bin_full_edges__<tag>` to force a clean migration.
+- **Unbinned rows are auto-excluded.** `np.digitize(metric, full_edges) - 1` returns -1 below / N above the bin coverage; both are masked into `_excluded_rows_mask` and dropped from the scatter + marginals. Caption surfaces the unbinned count alongside the explicitly-excluded count: `bins applied · N bins · K excluded · M unbinned`.
+- Files: `app.py`.
+
+## v0.12.3 — 2026-05-11
+- **One range slider per bin (replaces edge sliders).** Each bin's row now is `[include checkbox][color swatch][range slider with start + end thumbs]` — the slider's two thumb values ARE the bin's start/end ticks Pablo asked for. Bin 0's left thumb is locked at `dmin`, bin N−1's right thumb at `dmax`; middle bins span `(edges[k-1], edges[k])`.
+- **Edges stored once in `st.session_state[pc_bin_edges__<tag>]`** as the source of truth. Each slider has an `on_change` callback that writes the moved thumb back into the edges list, then propagates the new shared boundary into the adjacent bin's slider state (keeps neighbours in sync without thumbs drifting). Edges sorted on every update so out-of-order drags self-correct.
+- **Old per-bin text legend (start—end labels) removed** since the slider now visualises the same start/end values directly.
+- Files: `app.py`.
+
+## v0.12.2 — 2026-05-11
+- **Per-bin row UI inside the `color` expander.** When bins are applied each bin gets its own row: an `include` checkbox + color swatch + start tick (`<code>{lo:.3g}</code>`) + end tick (`<code>{hi:.3g}</code>`). The two ticks make the bin boundaries explicit instead of relying on a `[lo, hi]` legend. Replaces the old `<br>`-joined HTML legend for custom bins (library-categorical legends still use the old compact form).
+- **Unchecking a bin removes its rows from the scatter** (and stacked marginals). Builds an `_excluded_rows_mask` per-bin via `np.isin(_idx, excluded_set)`, then `valid &= ~_excluded_rows_mask` before the scatter is drawn. NaN-metric rows are never auto-excluded by bin index. Caption surfaces the excluded count.
+- Files: `app.py`.
+
+## v0.12.1 — 2026-05-11
+- **Plot controls grouped into collapsible expanders, all closed by default.** Five sections inside the bordered `Plot controls` panel: `library category` (annotation column + filter, lifted out of its old standalone block), `axes` (x/y axis choosers), `color` (color-by selectbox + `discretize into bins` toggle + binning UI + per-bin legend), `layout` (dot size, figure width/height, auto axis limits + manual mins/maxes), `marginals` (marginal x/y), `overlays` (FiNeMo hits checkbox, highlight csv row). The data-pool building (axis_pool, color_pool) stays outside expanders so binning controls can read the current color metric on first paint. Each expander reveals its widgets only when clicked, so the panel header is just six section labels by default.
+- Files: `app.py`.
+
+## v0.12.0 — 2026-05-11
+- **Binning is now an inline option on any continuous color metric** instead of a special `custom bins` entry. The `custom bins` and `metric to bin` selectboxes are gone — pick any continuous color via `color by`, then flip the `discretize into bins` toggle that appears beneath it. Toggle off → normal continuous coloring (state A). Toggle on, bins not yet `set` → continuous coloring + vertical gradient strip on the right with bar-position preview (state B). Click `set bins` → discrete coloring with X distinct categorical colors and the gradient strip disappears (state C). Click `unset bins` to go back to preview.
+- **X distinct categorical colors for X bins.** Bin colors come from the existing `_PALETTE` (Wong + extension, 12 entries, recycles past 12) instead of `sample_colorscale` along the active continuous colormap — adjacent bins are now visually distinct rather than near-identical gradient samples.
+- **`# bars` cap raised to 11** (was 7) since the categorical palette can support up to 12 distinct colors before recycling.
+- All session-state keys for the binning UI are scoped by `color_mode`, so switching the active color metric resets the toggle/edges cleanly.
+- Files: `app.py`.
+
+## v0.11.5 — 2026-05-11
+- **Discrete coloring now splits the scatter into one trace per category** ordered by point count DESC (largest added first → smallest rendered ON TOP), so small bins are no longer buried under the dominant cloud. Applies to all discrete coloring (custom bins + library categorical).
+- **Per-category stacked marginals.** When discrete and a marginal is enabled, each category gets its own colored bar at every shared bin edge; bars stack (`barmode="stack"`) in the same largest-first order so smaller categories sit at the top of the column. Density/probability normalize against the global finite count so stacked totals stay comparable. Replaces the old "fall back to plain gray counts" path. Helper `_shared_edges` builds the common 30-bin grid once per axis; helper `_add_discrete_marg` does the per-category bincount + Bar emit (used for both x and y orientations).
+- Files: `app.py`.
+
+## v0.11.4 — 2026-05-11
+- **`set bins` button gates the discrete coloring.** In custom-bins mode the scatter is now colored continuously by the chosen metric until the user clicks `set bins` — the bars on the gradient act as a live preview of where the cuts would land, so you can position them against the continuous colormap. Clicking commits the current edges, switches the scatter to discrete coloring, and unlocks `bin_<metric>` in the download popover. Button label flips to `back to continuous` once active. State stored in `st.session_state["pc_color_bins_active"]`. Caption beneath the button surfaces the current state (`preview …` / `bins applied · N bins`).
+- **Scatter's native colorbar is suppressed in custom-bins mode** (added `show_colorbar` arg to `_scatter_fig`) so the right-side gradient strip is the only colorbar — no double colorbars in continuous-preview mode.
+- Files: `app.py`.
+
+## v0.11.3 — 2026-05-11
+- **Custom-bins control relabeled `# bars` (default 2), with `# bins = # bars + 1`.** Bars on the gradient *are* the bin boundaries — the new label matches that mental model. Default 2 bars → 3 bins.
+- **Bin assignment is now an opt-in download column.** When custom-bins coloring is active, `download lib` exposes `bin_<metric>` (e.g. `bin_log2FC HepG2 − K562`) in the columns multiselect; selecting it writes the per-row bin label (`[lo, hi]`, or `NA` if the metric was NaN) into the CSV. Default-off so existing exports are unchanged.
+- Files: `app.py`.
+
+## v0.11.2 — 2026-05-11
+- **Custom-bins gradient now sits to the right of the scatter** instead of inside the left controls panel. Switched to a vertical `go.Heatmap` (height = `plot_fig_h`, width 120 px) with `add_hline` edge bars and `yaxis.side="right"` — visually it occupies the same slot as the scatter's native colorbar. Slider controls for each edge stay in the left controls panel. Scatter render is wrapped in `st.columns([6, 1])` only when `_color_grad_fig` is set; non-bins modes render the scatter at full width as before.
+- Files: `app.py`.
+
+## v0.11.1 — 2026-05-11
+- **Custom-bins widget redesigned to mirror the scatter colorbar.** Histogram + separate color strip dropped — replaced with a single horizontal `go.Heatmap` rendered with the active `plot_colorscale` (so the strip looks identical to the scatter's continuous colorbar) and black `add_vline` bars at each edge. Edge controls are now `st.slider`s (one per inner edge) instead of number_inputs, so editing a bin boundary feels like dragging a thumb against the gradient.
+- Files: `app.py`.
+
+## v0.11.0 — 2026-05-11
+- **`color by → custom bins`.** New entry in the color-by selectbox that discretizes any continuous color metric into user-defined bins. When picked: sub-selectbox `metric to bin` (drawn from the continuous entries of `_color_pool`), `# bins` input (2–8, default 4), and N−1 `edge i` controls (default at evenly-spaced quantiles, clamped to `[dmin, dmax]`). Bin colors are sampled from the active `plot_colorscale` (`sample_colorscale` at midpoints) so the discrete swatches match the scatter's continuous look. Per-row hex array routes through the existing `_color_is_discrete` path; legend below the selectbox shows `[lo, hi]` ranges with swatches. NaN metric rows get `_NA_HEX`. Edge keys include `bin_metric` + `n_bins` so switching either resets stale values.
+- **Continuous color gradient now spans full data range** instead of 2–98% percentile clip — extreme highs and lows now map to distinct colorbar endpoints (no more saturating before the actual min/max).
+- Files: `app.py`.
+
+## v0.10.9 — 2026-05-11
+- **Download lib: `attr_<slot>` is now default-on, `imp_<slot>` removed.** Importance is `sequence · attr`, so downstream code can derive it from the two columns already present; one less heavy option in the multiselect. `attr_<slot>` (full hypothetical (4×L) = 800 floats per row, space-separated, row-major A→T) is selected by default for every ABC slot — the input-like default schema is now `seq_idx, name, chr, start, stop, sequence, pred_<slot>…, attr_<slot>…`. Resolved lazily per-box via `_cached_load`.
+- Files: `app.py`.
+
+## v0.10.8 — 2026-05-11
+- (Superseded by v0.10.9 — imp removed, attr default-on.) Added `attr_<slot>` and `imp_<slot>` as download options.
+- Files: `app.py`.
+
+## v0.10.7 — 2026-05-11
+- **Unified `color by` pool with discrete categorical support.** The `color by` selectbox now draws from the same value pool as the x/y axis dropdowns (every continuous axis option) plus per-slot `residual (slot − ct)` entries and the legacy `average magnitude` synthetic, AND any low-cardinality (≤20 unique) library column as a true discrete entry (`library: {col}`). Discrete entries use a 12-color colorblind-friendly palette (Wong + extension) with `#BDBDBD` reserved for missing; per-row hex strings feed `marker.color` directly so Plotly draws true categorical colors instead of mapping codes through a continuous colormap. Old `pred_cts`/`meas_cts`/`resid_cts` cascade and `_CM_PRED/_CM_MEAS/_CM_RESID/_CM_XAXIS/_CM_ANNOT` constants removed; the intermediate `color_cell_line` selectbox is gone — each combo is an explicit pool entry. `_scatter_fig` gains a `discrete: bool` cache-key arg: when true, marker drops `colorscale`/`colorbar`/`cmin`/`cmax`, hover loses `color=` line, and marginal histograms fall back to plain counts (no color-weighted means). Percentile clip and `_color_arr` finite-check are skipped for discrete. A compact swatch+label legend renders directly below the selectbox when discrete (≤12 categories, names truncated at 28 chars). The point-click → csv_row flow, box overlays, and highlight ring are unaffected.
+- Files: `app.py`.
+
+## v0.10.6 — 2026-05-11
+- **Download lib: input-like compact default schema.** Default columns are now `seq_idx, name, chr, start, stop, sequence` + one `pred_<slot>` column per ABC slot with a `pred_key`. Library `*_hg38` columns are renamed to `chr/start/stop` on output. Optional pool also includes the three `*_log2FC` columns + `category` + `str_hg38` (unchecked by default). `box_color` removed from the CSV (`box_id` alone suffices). New `float decimals` input (default 4) feeds `to_csv(float_format=…)` so predictions/log2FC stay compact.
+- Files: `app.py`.
+
+## v0.10.5 — 2026-05-11
+- **3D mech axis is now "deviation from shared" via eigendecomposition** (matches `genomic_targets/scripts/3d_example/eigen_interactions_filtering.ipynb`). New `dev_from_shared_eig(imp_list, weighted)` in `scoring.py`: per-sequence covariance of z-normalised importance across the N cell types → eigendecomposition → return `1 - |EI_1 · shared_dir|` (range [0, 1]; 0 = perfectly shared, 1 = orthogonal). Sign-invariant.
+- **Sidebar `score (mech axis)` in 3D** now has only `cossim` (default — unweighted) and `EigenMaps` (= `var_ratio_1 × (1 - |EI_1·shared|)`, analog of 2D `var_ratio*r`). `dev_from_shared` is no longer a dropdown option — it IS the y-axis, and these two options just choose how to compute it. New cached `_dev_eig_full` mirrors `_dev_full`'s plumbing.
+- **Color-clipping UI removed.** The `auto (2–98%) / manual / full range` radio + manual `vmin/vmax` inputs are gone — colorbar always uses auto 2–98% now.
+- Files: `app.py`, `kcee_ui/scoring.py`.
+
+## v0.10.4 — 2026-05-11
+- (Superseded by v0.10.5 — 3D score model rewritten.) 3D mode `cossim`/`EigenMaps`/`dev_from_shared` chooser via pairwise mean; color-clipping UI removed.
+- Files: `app.py`.
+
+## v0.10.3 — 2026-05-11
+- **Plot controls panel consolidation.** Colorscale selectbox dropped — `plot_colorscale` is now pinned to the per-score-type default `score_cmap` (`RdBu_r` for cossim, `Inferno` for EigenMaps, `Magma` for dev_from_shared). New `dot size` slider (1–12, default 4) threaded through `_scatter_fig` and applied to both the base scatter marker and box-overlay markers (highlight ring stays at 16). Sidebar `Library annotation` section moved into the plot controls panel as `library category`; widgets render in the same bordered container, rendered in two passes (annotation before scoring, rest after). New `x-axis` / `y-axis` selectboxes — pool includes `auto`, score (mech axis), per-CT measured log2FC, per-slot predicted activity, `log2FC HepG2 − K562`, and `pred(A) − pred(B)` (when both have pred_keys); overrides apply before the `valid` mask is built and update axis labels.
+- Files: `app.py`.
+
+## v0.10.2 — 2026-05-11
+- **Colorbar title runs vertically alongside the gradient** (`colorbar.title.side="right"`) — long labels like `measured log2FC (HepG2)` no longer eat horizontal space above the scale. Applied in both kcee mode (`_scatter_fig` marker) and SEAM mode (per-type marker).
+- **Colorscale options curated to colorblind-friendly only.** New list: `Viridis` (default), `Cividis`, `Plasma`, `Magma`, `Inferno` (sequential) + `RdBu_r`, `PuOr_r` (diverging). Dropped `Turbo` (rainbow-like, not CB-safe). Applied to both modes; `dev_from_shared` 3D-mode default switched from `Turbo` to `Magma`.
+- Files: `app.py`, `kcee_ui/seam.py`.
+
+## v0.10.1 — 2026-05-11
+- **Box numbering is now position-based, assigned at render/download time.** Boxes carry only a hidden `_uid` (stable widget key) and a color; the displayed `box N` label uses the current array position (1-based). Deleting box 2 of {1,2,3} leaves the remaining two relabeled as box 1 and box 2 — no gaps. CSV `box_id` column likewise uses the position at download time.
+- Files: `app.py`.
+
+## v0.10.0 — 2026-05-11
+- **Isolate / box-select on the scatter.** New toolbar strip above the kcee scatter: `isolate` toggle (left), inline box chips with colored swatch + point count + `✕` delete (middle), and `download lib` popover + `clear boxes` button (right). When isolate is on, the scatter switches to `dragmode="select"` and `selection_mode=("points","box")`; dragging a box appends to `st.session_state["isolate_boxes"]` (geometry-hash dedup via `isolate_last_box_hash` so reruns don't re-append). Each box is drawn as a rect shape + a color-matched overlay Scattergl on top of the base trace (base trace untouched so the point-click → csv_row flow is unchanged for non-isolate clicks). Point-click is gated off while isolate mode is active. Download popover builds a combined `library.iloc[rows] × box_id/box_color` CSV (per-box rows, no dedup) with user-selected boxes/columns. `_scatter_fig` gained `dragmode`/`boxes_hash` cache-key args plus a leading-underscore `_boxes` pass-through so cache invalidates on dragmode/box changes but doesn't try to hash the live box list.
+- Files: `app.py`.
+
 ## v0.9.4 — 2026-05-11
 - **SEAM: background is the intra-cluster bg, not the scaled avg.** Per `seam_foreground_viewer.ipynb`, the "background" should be `cluster_backgrounds[ref_cluster_idx]` (the entropic-position bg from MetaExplainer at the seq's reference cluster), NOT `average_background_scaled.npy` which was the global cell-type average. New helper `_load_intra_bg(seq_dir)` resolves the ref cluster and slices. Affects both the scatter (cossim-bg) and the rendered maps.
 - Stale cossim-bg numbers from earlier versions are invalidated automatically (Streamlit caches re-hash on function-code change).

@@ -16,6 +16,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
+from sklearn.mixture import GaussianMixture
 import streamlit as st
 
 from kcee_ui.loader import load_attr_file, list_attr_keys
@@ -1443,6 +1446,13 @@ with _pc:
         _bin_export_per_row_label: np.ndarray | None = None
         _continuous_metric_arr: np.ndarray | None = None
         _excluded_rows_mask: np.ndarray | None = None
+        _kmeans_labels: np.ndarray | None = None
+        _kmeans_k: int = 0
+        _kmeans_choice: str | None = None
+        _kmeans_n_fit: int = 0
+        _kmeans_feat_dim: int = 0
+        _kmeans_centroids_feat: np.ndarray | None = None
+        _kmeans_colors: list[str] = []
         color_label = "—"
         if color_mode == "auto (mean activity)":
             if "average magnitude" in _color_pool:
@@ -2231,6 +2241,250 @@ with _pc:
                         )
                         _color_grad_fig = _grad
                         st.caption("preview — click `set bins` to apply discrete coloring")
+
+        # K-means clustering. Independent of bins — both can be active at once.
+        # When committed AND bins are NOT committed, labels drive discrete color;
+        # when bins are committed too, bins win on color and k-means contributes
+        # the centroid overlay + cluster_label download column only.
+        _enable_km = st.checkbox(
+            "cluster by kmeans/gmm",
+            value=bool(st.session_state.get("pc_kmeans_enable", False)),
+            key="pc_kmeans_enable",
+        )
+        if _enable_km:
+            _cluster_method = st.radio(
+                "method", ["kmeans", "gmm"], horizontal=True,
+                key="pc_cluster_method",
+            )
+            # Resolve the active x/y arrays at this point so we can offer the
+            # (x, y) feature option and run the fit on the same arrays that will
+            # feed the scatter (line 2286-2291 redoes the same override below).
+            _x_for_km = x
+            _y_for_km = y
+            if x_axis_choice != "auto" and _axis_pool.get(x_axis_choice) is not None:
+                _x_for_km = np.asarray(_axis_pool[x_axis_choice], dtype=np.float32)
+            if y_axis_choice != "auto" and _axis_pool.get(y_axis_choice) is not None:
+                _y_for_km = np.asarray(_axis_pool[y_axis_choice], dtype=np.float32)
+            _km_opts = ["— pick features —", "(x, y)", "mech only (y-axis value)",
+                        "func only (x-axis value)"]
+            _color_is_cont_now = (
+                color_mode != "auto (mean activity)"
+                and _color_pool.get(color_mode) is not None
+                and _color_pool[color_mode][0] == "continuous"
+            )
+            if _color_is_cont_now:
+                _km_opts.append("(x, y) + active color metric")
+            _km_opts.append("single mech: pairwise cossim")
+            _km_opts.append("single mech: EI_1 / eigenmaps")
+            _km_choice = st.selectbox(
+                "features", _km_opts, index=0, key="pc_kmeans_features",
+            )
+            _km_k = int(st.slider("k (components)", 2, 12, 4, 1, key="pc_kmeans_k"))
+            _km_std = bool(st.checkbox("standardize", value=True,
+                                       key="pc_kmeans_standardize"))
+            _km_rs = int(st.number_input("random_state", value=0, step=1,
+                                          key="pc_kmeans_rs"))
+            _gmm_cov = ""
+            if _cluster_method == "gmm":
+                _gmm_cov = st.selectbox(
+                    "covariance_type", ["full", "tied", "diag", "spherical"],
+                    index=0, key="pc_gmm_cov",
+                )
+
+            # Resolve the feature matrix X_full (one row per common_csv row;
+            # NaN rows get excluded from the fit).
+            _Xcols: list[np.ndarray] = []
+            _km_ready = (_km_choice != "— pick features —")
+            if _km_ready:
+                if _km_choice == "(x, y)":
+                    _Xcols = [np.asarray(_x_for_km, dtype=np.float32),
+                              np.asarray(_y_for_km, dtype=np.float32)]
+                elif _km_choice == "mech only (y-axis value)":
+                    _Xcols = [np.asarray(_y_for_km, dtype=np.float32)]
+                elif _km_choice == "func only (x-axis value)":
+                    _Xcols = [np.asarray(_x_for_km, dtype=np.float32)]
+                elif _km_choice == "(x, y) + active color metric":
+                    _Xcols = [np.asarray(_x_for_km, dtype=np.float32),
+                              np.asarray(_y_for_km, dtype=np.float32),
+                              np.asarray(_color_pool[color_mode][1], dtype=np.float32)]
+                elif _km_choice == "single mech: pairwise cossim":
+                    _a_km = loaded[ABC[0]]; _b_km = loaded[ABC[1]]
+                    _a_map_km = _a_km["attr_csv_to_npz"]
+                    _b_map_km = _b_km["attr_csv_to_npz"]
+                    _aL_km = int(_cached_attr_shape(_a_km["path"], _a_km["key"])[2])
+                    _bL_km = int(_cached_attr_shape(_b_km["path"], _b_km["key"])[2])
+                    _cs_full = _cossim_full(
+                        _a_km["path"], _a_km["key"], _b_km["path"], _b_km["key"],
+                        csv_path, _map_hash(_a_map_km), _map_hash(_b_map_km),
+                        _resolve_insert_offset(_a_km, _aL_km),
+                        _resolve_insert_offset(_b_km, _bL_km),
+                        _a_map_km, _b_map_km,
+                    )
+                    _Xcols = [_cs_full[common_csv].astype(np.float32)]
+                elif _km_choice == "single mech: EI_1 / eigenmaps":
+                    if dim == "2D":
+                        _a_km = loaded[ABC[0]]; _b_km = loaded[ABC[1]]
+                        _a_map_km = _a_km["attr_csv_to_npz"]
+                        _b_map_km = _b_km["attr_csv_to_npz"]
+                        _aL_km = int(_cached_attr_shape(_a_km["path"], _a_km["key"])[2])
+                        _bL_km = int(_cached_attr_shape(_b_km["path"], _b_km["key"])[2])
+                        _em_full = _eigenmaps_full(
+                            _a_km["path"], _a_km["key"], _b_km["path"], _b_km["key"],
+                            csv_path, _map_hash(_a_map_km), _map_hash(_b_map_km),
+                            _resolve_insert_offset(_a_km, _aL_km),
+                            _resolve_insert_offset(_b_km, _bL_km),
+                            _a_map_km, _b_map_km,
+                        )
+                        _Xcols = [_em_full[common_csv].astype(np.float32)]
+                    else:
+                        _sl_km = [loaded[i] for i in ABC]
+                        _paths_km = tuple((s["path"], s["key"]) for s in _sl_km)
+                        _maps_km = tuple(s["attr_csv_to_npz"] for s in _sl_km)
+                        _mh_km = tuple(_map_hash(m) for m in _maps_km)
+                        _off_km = tuple(
+                            _resolve_insert_offset(s, int(_cached_attr_shape(s["path"], s["key"])[2]))
+                            for s in _sl_km
+                        )
+                        _de_full = _dev_eig_full(_paths_km, csv_path, _mh_km, _off_km,
+                                                  True, _maps_km)
+                        _Xcols = [_de_full[common_csv].astype(np.float32)]
+
+            _kmeans_choice = _km_choice if _km_ready else None
+            _kmeans_k = _km_k
+            if _km_ready and _Xcols:
+                _X_full = np.column_stack(_Xcols).astype(np.float32, copy=False)
+                _fit_mask = np.all(np.isfinite(_X_full), axis=1)
+                _N_valid = int(_fit_mask.sum())
+                _D_feat = int(_X_full.shape[1])
+                _kmeans_feat_dim = _D_feat
+                _est_ops = float(_N_valid) * float(_D_feat) * float(_km_k) * 300.0 * 10.0
+                if (_N_valid * _km_k > 200_000) or (_est_ops > 5e9):
+                    st.warning(
+                        f"clustering {_N_valid} rows × k={_km_k} ({_D_feat}D) "
+                        f"may take a few seconds — click 'set clusters' to proceed"
+                    )
+
+                _km_set_key = f"pc_kmeans_active"
+                _km_set = bool(st.session_state.get(_km_set_key, False))
+                _km_btn = "unset clusters" if _km_set else "set clusters"
+                if st.button(_km_btn, key="pc_kmeans_btn",
+                             use_container_width=True):
+                    _km_set = not _km_set
+                    st.session_state[_km_set_key] = _km_set
+
+                if _km_set:
+                    # Cache key: features + k + std + rs + axis tags + color tag
+                    # (only when used) + hash of the fit-mask row identity. Stable
+                    # across UI filter changes that don't alter the input space.
+                    _color_tag = color_mode if _km_choice == "(x, y) + active color metric" else ""
+                    _valid_csv = common_csv[_fit_mask]
+                    _vh = hashlib.sha1(np.ascontiguousarray(_valid_csv).tobytes()).hexdigest()[:16]
+                    _km_hash = hashlib.sha1(
+                        repr((_km_choice, int(_km_k), bool(_km_std), int(_km_rs),
+                              str(x_axis_choice), str(y_axis_choice), _color_tag, _vh,
+                              str(_cluster_method), str(_gmm_cov))).encode()
+                    ).hexdigest()[:16]
+                    _km_lbl_key = f"pc_kmeans_labels__{_km_hash}"
+                    _km_ctr_key = f"pc_kmeans_centroids__{_km_hash}"
+                    if _km_lbl_key not in st.session_state and _N_valid >= _km_k:
+                        _Xfit = _X_full[_fit_mask].astype(np.float64, copy=True)
+                        if _km_std:
+                            _mu = _Xfit.mean(axis=0)
+                            _sd = _Xfit.std(axis=0)
+                            _sd = np.where(_sd > 0, _sd, 1.0)  # why: avoid div0 on constant cols
+                            _Xfit = (_Xfit - _mu) / _sd
+                        with st.spinner(f"fitting {_cluster_method}…"):
+                            if _cluster_method == "gmm":
+                                _km_model = GaussianMixture(
+                                    n_components=int(_km_k),
+                                    covariance_type=_gmm_cov,
+                                    random_state=int(_km_rs),
+                                    n_init=1,  # why: GMM n_init is slow; match sklearn default
+                                )
+                                _lab_fit = _km_model.fit_predict(_Xfit).astype(np.int32)
+                                _centroids_std = _km_model.means_.astype(np.float64)
+                            else:
+                                _km_model = KMeans(
+                                    n_clusters=int(_km_k), n_init=10,
+                                    random_state=int(_km_rs),
+                                )
+                                _lab_fit = _km_model.fit_predict(_Xfit).astype(np.int32)
+                                _centroids_std = _km_model.cluster_centers_.astype(np.float64)
+                        if _km_std:
+                            _centroids_feat = _centroids_std * _sd + _mu
+                        else:
+                            _centroids_feat = _centroids_std
+                        _full_lab = np.full(common_csv.shape[0], -1, dtype=np.int32)
+                        _full_lab[_fit_mask] = _lab_fit
+                        st.session_state[_km_lbl_key] = _full_lab
+                        st.session_state[_km_ctr_key] = _centroids_feat.astype(np.float32)
+                    if _km_lbl_key in st.session_state:
+                        _kmeans_labels = st.session_state[_km_lbl_key]
+                        _kmeans_centroids_feat = st.session_state[_km_ctr_key]
+                        _kmeans_n_fit = int((_kmeans_labels >= 0).sum())
+                        _kmeans_colors = _extended_palette(int(_km_k))
+                    st.caption(f"{_cluster_method} applied · k={_km_k} · features={_km_choice} · n_fit={_kmeans_n_fit}")
+                    if st.session_state.get("pc_kmeans_active", False) and _kmeans_labels is not None:
+                        _show_tsne = st.checkbox(
+                            "show t-SNE embedding",
+                            value=bool(st.session_state.get("pc_tsne_show", False)),
+                            key="pc_tsne_show",
+                        )
+                        if _show_tsne:
+                            _tsne_perp = int(st.slider("perplexity", 5, 50, 30, 1,
+                                                       key="pc_tsne_perplexity"))
+                            _tsne_rs = int(st.number_input("random_state (t-SNE)", value=0,
+                                                           step=1, key="pc_tsne_rs"))
+                            _N_valid_tsne = int(_fit_mask.sum())
+                            _est_s = (_N_valid_tsne / 5000.0) * (_tsne_perp / 30.0) * 60.0
+                            if _est_s > 30 or _N_valid_tsne > 20000:
+                                st.warning(
+                                    f"t-SNE on {_N_valid_tsne} rows with perplexity={_tsne_perp} "
+                                    f"may take ~{_est_s:.0f}s — click 'run t-SNE' to compute"
+                                )
+                            if _tsne_perp > _N_valid_tsne / 3:
+                                st.warning("perplexity too high for N — sklearn will clip")
+                            _tsne_hash = hashlib.sha1(
+                                repr((_km_hash, int(_tsne_perp), int(_tsne_rs))).encode()
+                            ).hexdigest()[:16]
+                            _tsne_emb_key = f"pc_tsne_emb__{_tsne_hash}"
+                            if st.button("run t-SNE", key="pc_tsne_run",
+                                         use_container_width=True):
+                                st.session_state["pc_tsne_active_hash"] = _tsne_hash
+                                if _tsne_emb_key not in st.session_state:
+                                    _Xfit_tsne = _X_full[_fit_mask].astype(np.float64, copy=True)
+                                    if _km_std:
+                                        _mu_t = _Xfit_tsne.mean(axis=0)
+                                        _sd_t = _Xfit_tsne.std(axis=0)
+                                        _sd_t = np.where(_sd_t > 0, _sd_t, 1.0)
+                                        _Xfit_tsne = (_Xfit_tsne - _mu_t) / _sd_t
+                                    _N_full = int(common_csv.shape[0])
+                                    _emb_full = np.full((_N_full, 2), np.nan, dtype=np.float32)
+                                    if _Xfit_tsne.shape[1] < 2:
+                                        # why: t-SNE needs >=2D; fall back to placing the 1D
+                                        # value on x with y=0 so the panel still renders.
+                                        st.info("feature dim < 2 — placing 1D values on x with y=0")
+                                        _emb_full[_fit_mask, 0] = _Xfit_tsne[:, 0].astype(np.float32)
+                                        _emb_full[_fit_mask, 1] = 0.0
+                                    else:
+                                        with st.spinner(f"running t-SNE on {_N_valid_tsne} rows…"):
+                                            _emb = TSNE(
+                                                n_components=2, perplexity=float(_tsne_perp),
+                                                init="pca", random_state=int(_tsne_rs),
+                                            ).fit_transform(_Xfit_tsne)
+                                        _emb_full[_fit_mask] = _emb.astype(np.float32)
+                                    st.session_state[_tsne_emb_key] = _emb_full
+                            _tsne_active_hash = st.session_state.get("pc_tsne_active_hash")
+                            if (_tsne_active_hash == _tsne_hash
+                                and f"pc_tsne_emb__{_tsne_active_hash}" in st.session_state):
+                                st.caption(f"embedding ready · perplexity={_tsne_perp} · seed={_tsne_rs}")
+                            else:
+                                st.caption("no embedding yet — click `run t-SNE`")
+                else:
+                    st.caption("preview — click `set clusters` to apply")
+                    # why: drop stale t-SNE state when k-means is uncommitted.
+                    st.session_state.pop("pc_tsne_active_hash", None)
+
         # Library-categorical legend (custom-bins legend is rendered inline above).
         if _color_is_discrete and _color_legend and _bin_export_name is None:
             _rows = []
@@ -2289,6 +2543,31 @@ if x_axis_choice != "auto" and _axis_pool.get(x_axis_choice) is not None:
 if y_axis_choice != "auto" and _axis_pool.get(y_axis_choice) is not None:
     y = np.asarray(_axis_pool[y_axis_choice], dtype=np.float32)
     score_label = y_axis_choice
+
+# K-means: when committed AND bins are NOT committed, labels drive discrete
+# coloring. When bins are committed too, bins keep the color slot — labels are
+# still attached via centroid overlay and the download column below.
+_km_drives_color = (
+    _kmeans_labels is not None
+    and _bin_export_per_row_label is None
+)
+if _km_drives_color:
+    _km_palette = _kmeans_colors
+    _km_hex = np.full(common_csv.shape[0], _NA_HEX, dtype="<U7")
+    _ok = (_kmeans_labels >= 0)
+    if _ok.any():
+        _km_hex[_ok] = np.array(
+            [_km_palette[int(i)] for i in _kmeans_labels[_ok]], dtype="<U7"
+        )
+    _color_arr = _km_hex
+    _color_is_discrete = True
+    color_label = f"k-means (k={_kmeans_k})"
+    _km_counts = np.bincount(_kmeans_labels[_ok].astype(np.int64),
+                             minlength=int(_kmeans_k)) if _ok.any() else np.zeros(int(_kmeans_k), dtype=np.int64)
+    _color_legend = [
+        (f"cluster {i} · n={int(_km_counts[i])}", _km_palette[i])
+        for i in range(int(_kmeans_k))
+    ]
 
 # Shared color array (aligned to common_csv) was resolved inside _pc above.
 # Discrete colors are per-row hex strings; continuous is a numeric array.
@@ -2353,6 +2632,56 @@ fig = _scatter_fig(
     _boxes=_boxes,
 )
 
+# Centroid overlay (k-means committed). Centroids live in feature space; we
+# project them back to (x, y) for display: for 1D / non-(x,y) feature sets the
+# missing axis is filled with the mean of cluster-member visible rows.
+if _kmeans_labels is not None and _kmeans_centroids_feat is not None and _kmeans_k > 0:
+    _km_vis = _kmeans_labels[valid]
+    _km_xc = np.zeros(int(_kmeans_k), dtype=np.float64)
+    _km_yc = np.zeros(int(_kmeans_k), dtype=np.float64)
+    _km_n = np.zeros(int(_kmeans_k), dtype=np.int64)
+    for _ki in range(int(_kmeans_k)):
+        _msk = (_km_vis == _ki)
+        _km_n[_ki] = int(_msk.sum())
+        if _msk.any():
+            _km_xc[_ki] = float(_x[_msk].mean())
+            _km_yc[_ki] = float(_y[_msk].mean())
+        else:
+            _km_xc[_ki] = float(np.nan)
+            _km_yc[_ki] = float(np.nan)
+    _ctr = _kmeans_centroids_feat
+    if _kmeans_choice == "(x, y)":
+        _km_xc = _ctr[:, 0].astype(np.float64)
+        _km_yc = _ctr[:, 1].astype(np.float64)
+    elif _kmeans_choice == "(x, y) + active color metric":
+        _km_xc = _ctr[:, 0].astype(np.float64)
+        _km_yc = _ctr[:, 1].astype(np.float64)
+    elif _kmeans_choice == "mech only (y-axis value)":
+        _km_yc = _ctr[:, 0].astype(np.float64)
+    elif _kmeans_choice == "func only (x-axis value)":
+        _km_xc = _ctr[:, 0].astype(np.float64)
+    else:
+        # single-mech features (cossim / EI_1) — centroid is a mech value, plot
+        # it on the y-axis with the cluster-member mean x.
+        _km_yc = _ctr[:, 0].astype(np.float64)
+    _km_hover = [f"cluster {i} · n={int(_km_n[i])}" for i in range(int(_kmeans_k))]
+    _ctr_size = max(12, int(plot_dot_size) * 2)
+    _ctr_trace = go.Scattergl(
+        x=_km_xc, y=_km_yc, mode="markers",
+        marker=dict(
+            size=_ctr_size,
+            color=list(_kmeans_colors[:int(_kmeans_k)]),
+            line=dict(color="black", width=1.5),
+            opacity=1.0,
+        ),
+        text=_km_hover, hovertemplate="%{text}<extra></extra>",
+        showlegend=False, name="kmeans_centroids",
+    )
+    if (plot_marg_x != "none") or (plot_marg_y != "none"):
+        fig.add_trace(_ctr_trace, row=2, col=1)
+    else:
+        fig.add_trace(_ctr_trace)
+
 with _center:
     _tb_left, _tb_mid, _tb_right = st.columns([1, 6, 2])
     with _tb_left:
@@ -2416,6 +2745,12 @@ with _center:
             _extra_arrays: dict[str, np.ndarray] = {}
             if _bin_export_name is not None and _bin_export_per_row_label is not None:
                 _extra_arrays[_bin_export_name] = _bin_export_per_row_label
+            if _kmeans_labels is not None:
+                _km_lbl_str = np.array(
+                    [f"cluster_{int(i)}" if int(i) >= 0 else "" for i in _kmeans_labels],
+                    dtype=object,
+                )
+                _extra_arrays["cluster_label"] = _km_lbl_str
             _all_opts = ["seq_idx"] + _lib_cols + list(_pred_arrays.keys()) \
                       + list(_attr_slots.keys()) + list(_extra_arrays.keys())
             _default_cols = ["seq_idx", "name", "chr_hg38", "start_hg38", "stop_hg38", "sequence"] \
@@ -2521,6 +2856,72 @@ with _center:
             key=_scatter_key,
         )
 
+    # --- t-SNE diagnostic panel (below the main scatter, full width) ---
+    tsne_event = None
+    _tsne_active_hash = st.session_state.get("pc_tsne_active_hash")
+    _tsne_emb = (st.session_state.get(f"pc_tsne_emb__{_tsne_active_hash}")
+                 if _tsne_active_hash else None)
+    if (_kmeans_labels is not None and _kmeans_k > 0
+            and _tsne_emb is not None
+            and st.session_state.get("pc_tsne_show", False)):
+        _tsne_x_full = _tsne_emb[:, 0]
+        _tsne_y_full = _tsne_emb[:, 1]
+        _tsne_finite = np.isfinite(_tsne_x_full) & np.isfinite(_tsne_y_full)
+        _tsne_pal = _extended_palette(int(_kmeans_k))
+        _tsne_perp_disp = int(st.session_state.get("pc_tsne_perplexity", 30))
+        tsne_fig = go.Figure()
+        # Order traces by cluster count DESC so smaller clusters render on top.
+        _tsne_counts = []
+        for _ki in range(int(_kmeans_k)):
+            _m = _tsne_finite & (_kmeans_labels == _ki)
+            _tsne_counts.append((int(_m.sum()), _ki, _m))
+        _tsne_counts.sort(key=lambda t: -t[0])
+        _tsne_dot = max(3, int(plot_dot_size) - 1)
+        for _cnt, _ki, _m in _tsne_counts:
+            if not _m.any():
+                continue
+            _rows = common_csv[_m]
+            _hov = [f"seq_idx={int(_r)} · cluster={_ki}" for _r in _rows]
+            tsne_fig.add_trace(go.Scattergl(
+                x=_tsne_x_full[_m], y=_tsne_y_full[_m],
+                mode="markers",
+                marker=dict(size=_tsne_dot, color=_tsne_pal[_ki], opacity=0.85),
+                customdata=_rows.astype(np.int64),
+                text=_hov, hovertemplate="%{text}<extra></extra>",
+                name=f"cluster {_ki} · n={_cnt}", showlegend=False,
+            ))
+        # Centroids over t-SNE space (mean of finite t-SNE coords per cluster).
+        _ctr_x, _ctr_y, _ctr_n, _ctr_col = [], [], [], []
+        for _ki in range(int(_kmeans_k)):
+            _m = _tsne_finite & (_kmeans_labels == _ki)
+            if _m.any():
+                _ctr_x.append(float(_tsne_x_full[_m].mean()))
+                _ctr_y.append(float(_tsne_y_full[_m].mean()))
+                _ctr_n.append(int(_m.sum()))
+                _ctr_col.append(_tsne_pal[_ki])
+        if _ctr_x:
+            _ctr_hover = [f"cluster {i} · n={_ctr_n[i]}" for i in range(len(_ctr_x))]
+            tsne_fig.add_trace(go.Scattergl(
+                x=_ctr_x, y=_ctr_y, mode="markers",
+                marker=dict(size=max(12, int(plot_dot_size) * 2),
+                            color=_ctr_col,
+                            line=dict(color="black", width=1.5)),
+                text=_ctr_hover, hovertemplate="%{text}<extra></extra>",
+                showlegend=False, name="tsne_centroids",
+            ))
+        tsne_fig.update_layout(
+            title=f"t-SNE of cluster feature space (k={int(_kmeans_k)}, perplexity={_tsne_perp_disp})",
+            width=plot_fig_w, height=plot_fig_h,
+            margin=dict(l=40, r=20, t=50, b=40),
+            xaxis=dict(title="tsne-1", showticklabels=False),
+            yaxis=dict(title="tsne-2", showticklabels=False, scaleanchor="x"),
+        )
+        tsne_event = st.plotly_chart(
+            tsne_fig, use_container_width=False,
+            on_select="rerun", selection_mode=("points",),
+            key=f"tsne_chart__{_tsne_active_hash}",
+        )
+
 
 # --- isolate-mode: capture a new box selection ---
 # Hash latest box geometry and only append on change, else every rerun
@@ -2555,6 +2956,12 @@ if not _isolate_mode and sel and sel.get("points"):
         pt = pts[0]
         if pt.get("customdata") is not None:
             sel_csv = int(pt["customdata"])
+# t-SNE diagnostic panel feeds the same row-picker.
+_tsne_sel = getattr(tsne_event, "selection", None) if tsne_event is not None else None
+if sel_csv is None and _tsne_sel and _tsne_sel.get("points"):
+    _tpts = [p for p in _tsne_sel["points"] if p.get("customdata") is not None]
+    if _tpts:
+        sel_csv = int(_tpts[0]["customdata"])
 
 st.markdown("---")
 if sel_csv is None:

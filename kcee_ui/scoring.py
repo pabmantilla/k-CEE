@@ -109,6 +109,32 @@ def dev_from_shared_eig(imp_list: list[np.ndarray], weighted: bool = False) -> n
     return dev.astype(np.float32)
 
 
+def top_eigvec_from_shared(imp_list: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Per-sequence dominant eigenvector of the cell-type covariance.
+
+    Mirrors `dev_from_shared_eig` exactly (same per-row z-norm, same covariance
+    einsum, same eigh) but instead of the scalar deviation returns:
+        ei1       (n, n_ct) float32 -- top eigenvector, sign-fixed so the first
+                  component is non-negative.
+        var_ratio (n,)      float32 -- lam_max / sum(lam).
+    """
+    if len(imp_list) < 2:
+        raise ValueError("Need at least 2 importance stacks.")
+    n = min(a.shape[0] for a in imp_list)
+    z = np.stack(
+        [_z_normalize_per_row(a[:n].astype(np.float64)) for a in imp_list],
+        axis=1,
+    )  # (n, n_ct, L)
+    L = z.shape[2]
+    C = np.einsum('njk,nlk->njl', z, z) / L  # (n, n_ct, n_ct)
+    eigvals, eigvecs = np.linalg.eigh(C)  # ascending; top = last column
+    ei1 = eigvecs[..., -1]                # (n, n_ct)
+    ei1 = ei1 * np.sign(eigvecs[:, :1, -1] + 1e-12)
+    total = eigvals.sum(axis=-1)
+    var_ratio = np.where(total > 0, eigvals[..., -1] / total, 0.0)
+    return ei1.astype(np.float32), var_ratio.astype(np.float32)
+
+
 def deviation_from_shared(imp_list: list[np.ndarray]) -> np.ndarray:
     """Per-sequence deviation from the equiangular ray across cell types.
 

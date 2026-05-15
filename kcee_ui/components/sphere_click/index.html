@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<script src="./plotly.min.js"></script>
+<style>
+  html,body{margin:0;padding:0;background:#000;color:#ddd;
+            font:12px system-ui,sans-serif;}
+  #status{padding:4px 8px;color:#9ad;}
+  #g{width:100%;}
+</style>
+</head>
+<body>
+<div id="status">loading plotly…</div>
+<div id="g"></div>
+<script>
+(function(){
+  var TARGET = window.parent;
+  var statusEl = document.getElementById("status");
+  var gd = document.getElementById("g");
+  var plotted = false;
+  var clickN = 0;
+  var hoverRow = null;          // csv row currently under the cursor
+  var downX = 0, downY = 0, downT = 0;
+
+  function status(t){ statusEl.textContent = t; }
+  function send(msg){
+    msg.isStreamlitMessage = true;
+    TARGET.postMessage(msg, "*");
+  }
+  function setHeight(h){ send({type:"streamlit:setFrameHeight", height:h}); }
+  function setValue(v){
+    send({type:"streamlit:setComponentValue", value:v, dataType:"json"});
+  }
+
+  function rowFromPoints(pts){
+    if(!pts || !pts.length) return null;
+    var cd = pts[0].customdata;
+    if(cd == null) return null;                  // wireframe / baseline line
+    var row = Array.isArray(cd) ? cd[0] : cd;
+    return (row == null) ? null : Number(row);
+  }
+  function select(row){
+    if(row == null) return;
+    clickN += 1;
+    status("selected row " + row);
+    setValue({row: row, n: clickN + "-" + Date.now()});
+  }
+  // Primary path: plotly_click (fires when gl3d registers a clean click).
+  function onClick(ev){ select(rowFromPoints(ev && ev.points)); }
+  // Reliable fallback: gl3d hover ALWAYS fires; remember the point under the
+  // cursor, then a native mouse-up with no drag = a click on that point.
+  function onHover(ev){ var r = rowFromPoints(ev && ev.points);
+                        if(r != null) hoverRow = r; }
+  function onUnhover(){ hoverRow = null; }
+  function onDown(e){ downX = e.clientX; downY = e.clientY; downT = Date.now(); }
+  function onUp(e){
+    var moved = Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY);
+    if(moved <= 6 && (Date.now() - downT) < 600 && hoverRow != null){
+      select(hoverRow);
+    }
+  }
+
+  function render(args){
+    if(typeof Plotly === "undefined"){
+      status("ERROR: plotly.min.js failed to load");
+      return;
+    }
+    var spec;
+    try { spec = JSON.parse(args.spec); }
+    catch(e){ status("ERROR: bad spec json: " + e); return; }
+    var h = args.height || 600;
+    if(spec.layout){ delete spec.layout.width; }   // responsive width
+    gd.style.height = h + "px";
+    var cfg = {responsive:true, displaylogo:false};
+    var pr = plotted
+      ? Plotly.react(gd, spec.data, spec.layout, cfg)
+      : Plotly.newPlot(gd, spec.data, spec.layout, cfg);
+    pr.then(function(){
+      setHeight(h + 30);
+      if(!plotted){
+        gd.on("plotly_click", onClick);
+        gd.on("plotly_hover", onHover);
+        gd.on("plotly_unhover", onUnhover);
+        gd.addEventListener("mousedown", onDown, true);
+        gd.addEventListener("mouseup", onUp, true);
+        plotted = true;
+      }
+      status("rendered — drag to rotate, click a dot to load its maps");
+    }).catch(function(e){ status("ERROR: plotly render: " + e); });
+  }
+
+  window.addEventListener("message", function(e){
+    var d = e.data;
+    if(!d || d.type !== "streamlit:render") return;
+    render(d.args || {});
+  });
+
+  // tell Streamlit we're ready so it sends the first render
+  send({type:"streamlit:componentReady", apiVersion:1});
+  setHeight(420);
+  status("ready — waiting for data…");
+})();
+</script>
+</body>
+</html>

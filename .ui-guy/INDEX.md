@@ -2,7 +2,4 @@
 - [WT alignment per source](wt_alignment.md) — `insert_offset` per slot + auto-detection from attr_L; how the off-by-15 bug happened and how to avoid it
 - [NaN rows in standardtorch file](nan_rows.md) — rows 18321/18322 are NaN; UI guards plots and zero-fills for scoring
 - [Alignment guard](alignment_guard.md) — `kcee_ui/alignment.py` replaces the silent first-m fallback; flags drop-policy mismatches at slot load and per cossim/EigenMap/dev call
-- [K-means clustering](kmeans_clustering.md) — `cluster by k-means` color-expander toggle: features dropdown, fit scope, cache key, interaction with bins, compute-cost threshold
-- [GMM clustering](gmm_clustering.md) — adds `method: kmeans/gmm` radio + `covariance_type` selectbox; everything else (cache, labels, centroids, t-SNE, download) is shared with k-means
-- [t-SNE panel](tsne_panel.md) — diagnostic t-SNE rendered below the main scatter, reuses the k-means feature matrix, colored by cluster id
 - [Version log](VERSION.md) — version + changelog

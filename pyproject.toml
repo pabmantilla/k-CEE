@@ -10,7 +10,6 @@ dependencies = [
     "h5py>=3.9",
     "matplotlib>=3.7",
     "plotly>=5.18",
-    "scikit-learn>=1.7.2",
 ]
 
 [build-system]

@@ -1,5 +1,60 @@
 # kcee-ui — version log
 
+## v0.19.3 — 2026-05-15
+- **Fixed `sphere render failed: Invalid element(s) … 'color' … [None]`.** Continuous color substituted NaN→`None`, which `Scatter3d.marker.color` rejects. Now NaN-color rows are dropped from the sphere via a plot mask `_pm` applied consistently to `x/y/z`, `customdata`, and color (matches the 2D scatter, which also hides NaN-color points). Discrete + var-ratio fallback unaffected.
+- Files: `app.py`, `.ui-guy/VERSION.md`.
+
+## v0.19.2 — 2026-05-15
+- **Reliable 3D click.** plotly's `plotly_click` rarely fires on gl3d (the camera treats almost any click as a drag → "just click and drag, no selection"). Synthesized a real click from events that DO fire reliably in 3D: `plotly_hover` tracks the point under the cursor; a native `mousedown`→`mouseup` with <6px movement and <600ms selects the hovered point. `plotly_click` kept as a bonus primary path. Drag-to-rotate unaffected (movement >6px = no select).
+- Files: `kcee_ui/components/sphere_click/index.html`, `.ui-guy/VERSION.md`.
+
+## v0.19.1 — 2026-05-15
+- **Wireframe sphere is now thin LINES, not a `go.Surface`.** The surface spanned the whole unit sphere and intercepted 3D click-rays before they reached the points behind it (plotly returns the topmost trace under the cursor — the surface — which has no `customdata`, so clicks were silently dropped). Lines (~1px, `hoverinfo='skip'`, no customdata) don't occlude, so clicks land on the points. Most likely cause of "renders but can't click".
+- Files: `app.py`, `.ui-guy/VERSION.md`.
+
+## v0.19.0 — 2026-05-15
+- **Sphere click rebuilt to actually work.** Root causes of prior failures: (1) CDN Plotly could be blocked → blank; (2) plotly.py 6 `to_json()` binary-encodes numpy arrays (base64 typed-arrays) which the bare component + JS click couldn't decode; (3) re-clicking the same dot returned an unchanged value so Streamlit didn't rerun.
+- Fixes: **Plotly.js 2.35.2 bundled locally** (`kcee_ui/components/sphere_click/plotly.min.js`, same-origin, no CDN). Figure data arrays (`x/y/z`, `customdata`, `marker.color`, surface mesh) emitted as **plain JSON lists** (`.tolist()`), so the browser gets standard arrays. Component returns `{row, n}` with a **click nonce** so every click (even the same dot) reruns. On-iframe **status line** surfaces load/render/click state for diagnosis.
+- `show csv row` number_input still kept as fallback. Figure math/colors/baseline unchanged from v0.17–0.18.
+- Files: `app.py`, `kcee_ui/components/sphere_click/index.html`, `kcee_ui/components/sphere_click/plotly.min.js` (new), `.ui-guy/VERSION.md`.
+
+## v0.18.0 — 2026-05-15
+- **True 3D click-select** via a no-build static `components.v1.declare_component` (Plotly 2.35.2 CDN + bare `postMessage`, no npm/pip). Renders the SAME plotly figure and posts the clicked point's `customdata[0]` (csv row) back to Python. Replaces native `st.plotly_chart` in the sphere branch — Streamlit native selection does not fire on `Scatter3d`. `show csv row` number_input kept as a manual fallback.
+- Files: `app.py`, `kcee_ui/components/sphere_click/index.html`, `.ui-guy/VERSION.md`.
+
+## v0.17.1 — 2026-05-15
+- **Reverted `streamlit-plotly-events`** — its 0.0.6 frontend does not render on Streamlit 1.57 (sphere went blank). Dependency removed. Sphere renders via native `st.plotly_chart` again (visible + rotatable). Native `on_select` selection is still attempted (harmless if 3D click no-ops); `show csv row` number_input remains the reliable selection path.
+- **Black backdrop**: explicit `paper_bgcolor`/`scene.bgcolor` black with white fonts and dark grid, matching the look Pablo preferred (no longer theme-dependent).
+- Files: `app.py`, `pyproject.toml`, `.ui-guy/VERSION.md`.
+
+## v0.17.0 — 2026-05-15
+- **Sphere reuses the panel color exactly**: removed the bespoke `st.selectbox("sphere color")` + tri-cmap/log2FC branch. The sphere `Scatter3d` now mirrors the 2D scatter — discrete → per-row hex; continuous → `plot_colorscale` with `_vmin/_vmax` and `color_label` colorbar; falls back to the viridis var-ratio tri-cmap (`cmin=1/3`) only when no panel color metric is active (all-NaN).
+- **True click-select** via `streamlit-plotly-events` (`plotly_events`, click only). Streamlit native `on_select` does not fire on `Scatter3d`. Maps `curveNumber`/`pointNumber` → `_csv_rows` → `sphere_pick_csv` → existing `sel_csv` pipeline. `show csv row` number_input kept as a secondary fallback.
+- **"fully shared (mech+func)" baseline**: dashed black `Scatter3d` line from origin along the equiangular diagonal `(1,1,1)/√3` (top eigenvector identical across all 3 cell types, var-ratio→1).
+- Files: `app.py`, `pyproject.toml`, `.ui-guy/VERSION.md`.
+
+## v0.16.1 — 2026-05-15
+- **3D sphere selection workaround**: Streamlit `on_select` does not fire on plotly `Scatter3d` clicks. Added a `show csv row` number_input under the sphere — hover a dot to read its `csv_row`, type it in → drives the existing `sel_csv` attribution panel (fallback after the event path). Hover template already exposes `csv_row`.
+- Files: `app.py`, `.ui-guy/VERSION.md`.
+
+## v0.16.0 — 2026-05-15
+- **Interactive plotly `Scatter3d` eigenvector sphere** replaces the static matplotlib sphere — rotate/zoom + click a point → attribution-logo panel, reusing the exact same `event.selection → sel_csv` pipeline as the 2D plotly scatter (point `customdata` = csv row id).
+- Faint `go.Surface` unit sphere as a non-clickable reference (`hoverinfo='skip'`).
+- Color selector (`st.selectbox`): default `EI_1 var ratio (z-norm)` (viridis tri-cmap, cmin=1/3) + one option per cell type `"{CT} log2FC"` (RdBu reversed, symmetric ±98th-pctile). Collapses the 3-panel-per-CT log2FC idea into one rotatable+selectable scene.
+- Removed matplotlib usage from this branch.
+- Files: `app.py`, `.ui-guy/VERSION.md`, `.ui-guy/design.md`.
+
+## v0.15.0 — 2026-05-15
+- **New default 3D main-panel view: matplotlib "eigenvector sphere"** — per-sequence dominant eigenvector of the z-normed cell-type importance covariance plotted on the unit sphere, radius = var-explained, colored by var-ratio (viridis tri-cmap). Math reuses the exact `dev_from_shared_eig` pipeline.
+- Added `view3d` sidebar radio (`eigenvector sphere` [default] / `scatter`); plotly scatter unchanged and reachable via toggle. 2D behavior untouched.
+- New `top_eigvec_from_shared` (kcee_ui/scoring.py) and disk-cached `_top_eigvec_full` (app.py, packed (N,4): cols 0:3 = eigvec, col 3 = var-ratio).
+- Files: `app.py`, `kcee_ui/scoring.py`.
+
+## v0.14.0 — 2026-05-14
+- **Removed clustering UI (kmeans, gmm, t-SNE diagnostic panel) — too slow.** Stripped the `cluster by kmeans/gmm` checkbox block from the `color` expander, the centroid overlay on the main scatter, the `cluster_label` download column, the t-SNE panel below the scatter, and the t-SNE → row-picker hop.
+- `sklearn` (`KMeans`, `TSNE`, `GaussianMixture`) imports dropped; `scikit-learn` removed from `pyproject.toml`.
+- Files: `app.py`, `pyproject.toml`.
+
 ## v0.13.3 — 2026-05-12
 - **`method` radio (`kmeans` / `gmm`) at top of the cluster block.** Checkbox label flips to `cluster by kmeans/gmm`; session key `pc_kmeans_enable` and downstream label/centroid/t-SNE plumbing unchanged.
 - **`covariance_type` selectbox for GMM** (`full` / `tied` / `diag` / `spherical`, default `full`); rendered only when method is `gmm`. Cache key extended with `(method, gmm_cov)`.
